@@ -44,6 +44,47 @@ python3 run_stringer_vstim.py
 
 6. Enter the mouse ID when prompted.
 
+## Running over SSH
+
+If you connect with `ssh -X` or `ssh -Y`, the remote shell usually exports a
+forwarded X11 display such as `DISPLAY=localhost:10.0`. Without an override,
+pygame/SDL will open on the forwarded display instead of the behavior Pi HDMI
+screen.
+
+`run_stringer_vstim.py` now detects that case and, by default, switches to the
+behavior Pi's local desktop display:
+
+- `DISPLAY=:0`
+- `SDL_VIDEODRIVER=x11`
+- `XAUTHORITY=~/.Xauthority` when that file exists
+
+At startup, the script prints the original and effective display environment,
+as well as the pygame display driver and detected screen size. The same display
+routing info is also saved into `metadata.json` for each session.
+
+For the cleanest launch over SSH, avoid X11 forwarding when you do not need it:
+
+```bash
+ssh -x pi@behavior-pi
+python3 run_stringer_vstim.py
+```
+
+If the behavior Pi monitor is showing the Raspberry Pi desktop, the default
+`DISPLAY_TARGET = ":0"` and `SDL_VIDEODRIVER_TARGET = "x11"` settings should
+be the right choice.
+
+If the behavior Pi monitor is only showing a Linux console/terminal and no
+local desktop session is running, X11 `:0` may not exist. In that case, edit
+these settings near the top of `run_stringer_vstim.py`:
+
+```python
+DISPLAY_TARGET = None
+SDL_VIDEODRIVER_TARGET = "kmsdrm"
+```
+
+That tells SDL to render directly to the Pi display stack instead of an X11
+session.
+
 ## Recommended pilot settings
 
 The script currently defaults to a short pilot:

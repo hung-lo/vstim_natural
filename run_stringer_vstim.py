@@ -27,14 +27,13 @@ hardware pilot with photodiode and oscilloscope/acquisition trace before real da
 
 import csv
 import json
+import os
 import random
 import socket
 import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-
-import pygame
 
 # ============================================================
 # USER SETTINGS
@@ -107,6 +106,20 @@ FULLSCREEN = True
 SCREEN_SIZE_OVERRIDE = (1280, 720)  # Used only if FULLSCREEN = False.
 KEEP_ASPECT_RATIO = True             # Letterbox images on gray background.
 
+# Display-routing settings.
+# When the script is launched over SSH with X11 forwarding, DISPLAY often points
+# to the forwarded session (for example localhost:11.0). In that case, pygame
+# opens on the remote machine instead of the behavior Pi HDMI display.
+#
+# This script defaults to the Pi's local desktop X server. If the behavior Pi is
+# showing a Linux console instead of a desktop session, try:
+#   DISPLAY_TARGET = None
+#   SDL_VIDEODRIVER_TARGET = "kmsdrm"
+FORCE_LOCAL_DISPLAY_WHEN_SSH = True
+DISPLAY_TARGET = ":0"
+SDL_VIDEODRIVER_TARGET = "x11"
+XAUTHORITY_TARGET = None  # None -> auto-use ~/.Xauthority when targeting local X11.
+
 # Screen colors. If your OLED hardware maps RGB to blue-only emission,
 # leave these as standard grayscale/RGB values and document that in metadata.
 GRAY_COLOR = (128, 128, 128)
@@ -136,6 +149,84 @@ DISPLAY_HARDWARE_NOTE = (
 # ============================================================
 # Utility functions
 # ============================================================
+
+pygame = None
+
+
+def is_forwarded_x11_display(display_value: str) -> bool:
+    """Return True when DISPLAY looks like an SSH-forwarded X11 session."""
+    if not display_value:
+        return False
+
+    normalized = display_value.lower()
+    if normalized.startswith("localhost/unix:"):
+        return True
+
+    host = normalized.split(":", 1)[0]
+    return host in {"localhost", "127.0.0.1", "::1"}
+
+
+def configure_display_environment():
+    """
+    Configure which display pygame/SDL should use.
+
+    This must run before importing pygame or initializing the video subsystem.
+    It is mainly needed when launching over SSH because DISPLAY may point to an
+    X11-forwarded remote display instead of the behavior Pi's physical screen.
+    """
+    original_display = os.environ.get("DISPLAY")
+    original_sdl_driver = os.environ.get("SDL_VIDEODRIVER")
+    original_xauthority = os.environ.get("XAUTHORITY")
+    forwarded_display = is_forwarded_x11_display(original_display)
+    should_force_local = FORCE_LOCAL_DISPLAY_WHEN_SSH and forwarded_display
+
+    if SDL_VIDEODRIVER_TARGET is not None and (should_force_local or not original_sdl_driver):
+        os.environ["SDL_VIDEODRIVER"] = SDL_VIDEODRIVER_TARGET
+
+    effective_sdl_driver = os.environ.get("SDL_VIDEODRIVER")
+
+    if DISPLAY_TARGET is not None and (
+        should_force_local or
+        (not original_display and effective_sdl_driver in (None, "", "x11"))
+    ):
+        os.environ["DISPLAY"] = DISPLAY_TARGET
+
+    # Console/KMS SDL backends should not inherit a forwarded X11 or Wayland session.
+    if effective_sdl_driver in {"kmsdrm", "fbcon", "directfb"}:
+        os.environ.pop("DISPLAY", None)
+        os.environ.pop("WAYLAND_DISPLAY", None)
+
+    xauthority_target = XAUTHORITY_TARGET
+    if xauthority_target is None:
+        local_xauthority = Path.home() / ".Xauthority"
+        if os.environ.get("DISPLAY") == DISPLAY_TARGET and local_xauthority.exists():
+            xauthority_target = str(local_xauthority)
+
+    if xauthority_target is not None and (should_force_local or not original_xauthority):
+        os.environ["XAUTHORITY"] = xauthority_target
+
+    info = {
+        "original_display": original_display,
+        "original_sdl_videodriver": original_sdl_driver,
+        "original_xauthority": original_xauthority,
+        "forwarded_x11_detected": forwarded_display,
+        "force_local_display_when_ssh": FORCE_LOCAL_DISPLAY_WHEN_SSH,
+        "effective_display": os.environ.get("DISPLAY"),
+        "effective_sdl_videodriver": os.environ.get("SDL_VIDEODRIVER"),
+        "effective_xauthority": os.environ.get("XAUTHORITY"),
+    }
+
+    print("Display environment:")
+    print(f"  original DISPLAY={info['original_display']}")
+    print(f"  original SDL_VIDEODRIVER={info['original_sdl_videodriver']}")
+    print(f"  original XAUTHORITY={info['original_xauthority']}")
+    print(f"  forwarded_x11_detected={info['forwarded_x11_detected']}")
+    print(f"  effective DISPLAY={info['effective_display']}")
+    print(f"  effective SDL_VIDEODRIVER={info['effective_sdl_videodriver']}")
+    print(f"  effective XAUTHORITY={info['effective_xauthority']}")
+
+    return info
+
 
 def sanitize_id(text: str) -> str:
     """Keep file-system-safe mouse/session text."""
@@ -288,6 +379,12 @@ def append_csv_row(path, row, fieldnames):
 # ============================================================
 
 def main():
+    display_env_info = configure_display_environment()
+
+    global pygame
+    import pygame as pygame_module
+    pygame = pygame_module
+
     # Validate ITI config early.
     if ITI_MODE not in ["fixed", "jittered"]:
         raise RuntimeError("ITI_MODE must be either 'fixed' or 'jittered'.")
@@ -384,6 +481,7 @@ def main():
         "selected_images_csv": str(selected_images_csv),
         "planned_sequence_csv": str(planned_sequence_csv),
         "event_log_csv": str(event_log_csv),
+        "display_env_info": display_env_info,
         "n_total_available_images": len(all_image_files),
         "n_images_used": len(image_files),
         "n_repeats": N_REPEATS,
@@ -474,8 +572,25 @@ def main():
 
         pygame.mouse.set_visible(False)
         screen_size = screen.get_size()
+        pygame_driver = pygame.display.get_driver()
+        pygame_num_displays = None
+        pygame_desktop_sizes = []
+        if hasattr(pygame.display, "get_num_displays"):
+            pygame_num_displays = pygame.display.get_num_displays()
+        if hasattr(pygame.display, "get_desktop_sizes"):
+            pygame_desktop_sizes = [list(size) for size in pygame.display.get_desktop_sizes()]
+
+        print(f"Pygame display driver: {pygame_driver}")
+        print(f"Pygame screen size: {screen_size}")
+        if pygame_num_displays is not None:
+            print(f"Pygame number of displays: {pygame_num_displays}")
+        if pygame_desktop_sizes:
+            print(f"Pygame desktop sizes: {pygame_desktop_sizes}")
 
         metadata["actual_screen_size_px"] = list(screen_size)
+        metadata["pygame_display_driver"] = pygame_driver
+        metadata["pygame_num_displays"] = pygame_num_displays
+        metadata["pygame_desktop_sizes"] = pygame_desktop_sizes
         with open(metadata_json, "w") as f:
             json.dump(metadata, f, indent=2)
 
