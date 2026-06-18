@@ -46,44 +46,48 @@ python3 run_stringer_vstim.py
 
 ## Running over SSH
 
-If you connect with `ssh -X` or `ssh -Y`, the remote shell usually exports a
-forwarded X11 display such as `DISPLAY=localhost:10.0`. Without an override,
-pygame/SDL will open on the forwarded display instead of the behavior Pi HDMI
-screen.
+This behavior Pi is intended to run headless. That means the right default is
+not X11 `:0`; it is the direct Raspberry Pi display backend that pygame/SDL can
+use when `DISPLAY` is unset.
 
-`run_stringer_vstim.py` now detects that case and, by default, switches to the
-behavior Pi's local desktop display:
-
-- `DISPLAY=:0`
-- `SDL_VIDEODRIVER=x11`
-- `XAUTHORITY=~/.Xauthority` when that file exists
-
-At startup, the script prints the original and effective display environment,
-as well as the pygame display driver and detected screen size. The same display
-routing info is also saved into `metadata.json` for each session.
-
-For the cleanest launch over SSH, avoid X11 forwarding when you do not need it:
+For the cleanest launch, connect without X11 forwarding:
 
 ```bash
 ssh -x pi@behavior-pi
+cd /home/pi/vstim_natural
+source .venv/bin/activate
+unset DISPLAY
+unset SDL_VIDEODRIVER
+python3 fullscreen_test.py
+```
+
+If the diagnostic screen test works, run the actual stimulus the same way:
+
+```bash
+ssh -x pi@behavior-pi
+cd /home/pi/vstim_natural
+source .venv/bin/activate
+unset DISPLAY
+unset SDL_VIDEODRIVER
 python3 run_stringer_vstim.py
 ```
 
-If the behavior Pi monitor is showing the Raspberry Pi desktop, the default
-`DISPLAY_TARGET = ":0"` and `SDL_VIDEODRIVER_TARGET = "x11"` settings should
-be the right choice.
+If the Pi needs an explicit SDL backend, try:
 
-If the behavior Pi monitor is only showing a Linux console/terminal and no
-local desktop session is running, X11 `:0` may not exist. In that case, edit
-these settings near the top of `run_stringer_vstim.py`:
-
-```python
-DISPLAY_TARGET = None
-SDL_VIDEODRIVER_TARGET = "kmsdrm"
+```bash
+SDL_VIDEODRIVER=RPI python3 fullscreen_test.py
+SDL_VIDEODRIVER=RPI python3 run_stringer_vstim.py
 ```
 
-That tells SDL to render directly to the Pi display stack instead of an X11
-session.
+The updated scripts now default to:
+
+- `DISPLAY_TARGET = None`
+- `SDL_VIDEODRIVER_TARGET = None`
+- `XAUTHORITY_TARGET = None`
+
+At startup, the scripts print the effective display environment plus pygame's
+reported display driver and screen size. If you still do not see the test
+pattern, run from a local Pi TTY so SDL can take over the visible framebuffer.
 
 ## Recommended pilot settings
 
