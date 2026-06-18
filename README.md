@@ -173,7 +173,7 @@ Folder containing natural-image PNGs.
 Example:
 
 ```python
-IMAGE_DIR = Path("/home/pi/stringer_natimg2800_png")
+IMAGE_DIR = Path("/home/pi/stringer_natimg2800_center_crop_png")
 ```
 
 The script searches for `*.png` files in this folder. It does not recursively search subfolders.
