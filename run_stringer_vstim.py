@@ -40,15 +40,17 @@ from pathlib import Path
 # Edit these values before running the experiment.
 # ============================================================
 
+SCRIPT_DIR = Path(__file__).resolve().parent
+
 # Folder containing natural image PNG files.
 # Example files: natimg_0000.png, natimg_0001.png, ...
-# IMAGE_DIR = Path("/home/pi/stringer_natimg2800_png")
-IMAGE_DIR = Path(r"D:\Codex_folder\vstim_stringer_rpi\stringer_natimg2800_center_crop_png")
+# If you copy this repo to /home/pi/vstim_natural, this resolves to:
+# /home/pi/vstim_natural/stringer_natimg2800_center_crop_png
+IMAGE_DIR = SCRIPT_DIR / "stringer_natimg2800_center_crop_png"
 
 # Root output folder. The script will create:
 # OUTPUT_ROOT / mouse_id / session_id / logs...
-# OUTPUT_ROOT = Path("/home/pi/stim_logs")
-OUTPUT_ROOT = Path(r"D:\Codex_folder\vstim_stringer_rpi\stim_logs")
+OUTPUT_ROOT = Path("/home/pi/stim_logs")
 
 
 # Number of unique images to use from IMAGE_DIR.

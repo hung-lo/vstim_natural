@@ -214,10 +214,11 @@ Folder containing natural-image PNGs.
 Example:
 
 ```python
-IMAGE_DIR = Path("/home/pi/stringer_natimg2800_center_crop_png")
+SCRIPT_DIR = Path(__file__).resolve().parent
+IMAGE_DIR = SCRIPT_DIR / "stringer_natimg2800_center_crop_png"
 ```
 
-The script searches for `*.png` files in this folder. It does not recursively search subfolders.
+If the repo lives at `/home/pi/vstim_natural`, this resolves to `/home/pi/vstim_natural/stringer_natimg2800_center_crop_png`. The script searches for `*.png` files in this folder. It does not recursively search subfolders.
 
 #### `OUTPUT_ROOT`
 
@@ -609,7 +610,7 @@ GRAY_DURATION_MAX = 1.0
 Check `IMAGE_DIR` and verify PNG files exist:
 
 ```bash
-ls /home/pi/stringer_natimg2800_png | head
+ls /home/pi/vstim_natural/stringer_natimg2800_center_crop_png | head
 ```
 
 ### GPIO error on laptop
