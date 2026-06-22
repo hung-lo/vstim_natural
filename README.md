@@ -1,9 +1,9 @@
 
 # Raspberry Pi Stringer Natural-Image Visual Stimulus Script
 
-This repo now has a deliberately small version 0 runtime for the headless behavior Pi.
-The goal is to prove that the Pi can actually show the images before we add any more
-stimulus machinery back in.
+This repo now uses the lab's `rpg` framebuffer path again, not pygame.
+That matters for the headless behavior Pi, because the screen is controlled
+directly from the Pi framebuffer rather than through a desktop/X11 session.
 
 Current entrypoint:
 
@@ -11,131 +11,87 @@ Current entrypoint:
 run_stringer_vstim.py
 ```
 
-What v0 does:
+What the runtime does:
 
 - asks for mouse ID and optional session notes
 - chooses a reproducible subset of Stringer center-crop PNGs
-- precomputes the display surfaces once at startup
-- shows each image fullscreen with gray ITI in between
-- logs planned sequence, event timestamps, and metadata
-- keeps the photodiode patch disabled by default
+- bakes session-specific `rpg` raw files at startup
+- displays each image fullscreen for a fixed duration
+- shows gray ITI between images
+- optionally bakes a photodiode patch into the frames
+- logs planned sequence, actual display timestamps, and metadata
 
-Why this version exists:
+## Expected paths on the Pi
 
-- the behavior Pi is headless
-- X11/desktop display routing was the wrong target
-- we want one simple path that can be verified from a Pi TTY first
-
-## Files
+The script looks for the PNG folder in these places:
 
 ```text
-run_stringer_vstim.py   Main runnable stimulus script, v0 display-only version
-fullscreen_test.py      Quick screen sanity test
-README.md               This documentation
+~/vstim_natural/stringer_natimg2800_center_crop_png
+~/stringer_natimg2800_center_crop_png
+./stringer_natimg2800_center_crop_png
 ```
 
-## Quick start
-
-1. Copy this folder to the Raspberry Pi.
-2. Make sure the PNG folder exists in one of these locations:
+Session output goes to:
 
 ```text
-/home/pi/vstim_natural/stringer_natimg2800_center_crop_png
-/home/pi/stringer_natimg2800_center_crop_png
+~/stim_logs/<mouse_id>/<session_id>/
 ```
 
-3. Install dependencies if needed:
+## Dependencies
+
+The runtime expects:
+
+- `rpg` installed from the SjulsonLab rpg repository
+- `Pillow`
+- `RPi.GPIO` on the Pi if GPIO output is enabled
+
+Example rpg install on the Pi:
 
 ```bash
-pip install pygame
+cd ~
+git clone https://github.com/SjulsonLab/rpg
+cd rpg
+sudo pip3 install .
 ```
 
-On a Raspberry Pi with GPIO output enabled, `RPi.GPIO` is also needed. It is often preinstalled on Raspberry Pi OS, but can usually be installed with:
+Or, if the repo is already present somewhere else, install it from that checkout.
+
+Install the Python packages used by this repo:
 
 ```bash
-pip install RPi.GPIO
+pip3 install Pillow
+pip3 install RPi.GPIO
 ```
 
-4. Run the fullscreen test from a Pi TTY first, not from the desktop terminal:
+## Running it
+
+Run the script from the behavior Pi itself, ideally from a local TTY or a plain
+SSH shell on the behavior Pi. Do not use X-forwarded sessions for this.
 
 ```bash
 cd ~/vstim_natural
-source .venv/bin/activate
-unset DISPLAY
-unset SDL_VIDEODRIVER
-unset XAUTHORITY
-python3 fullscreen_test.py
-```
-
-5. If that works, run the stimulus script the same way:
-
-```bash
-cd ~/vstim_natural
-source .venv/bin/activate
-unset DISPLAY
-unset SDL_VIDEODRIVER
-unset XAUTHORITY
 python3 run_stringer_vstim.py
 ```
 
-6. Enter the mouse ID when prompted.
-
-## Headless Pi notes
-
-The behavior Pi should be treated as a direct-display machine, not a normal X11 desktop.
-If you launch from the desktop terminal, pygame may initialize but never actually own
-the physical framebuffer. The safer test is a local TTY session.
-
-If the direct backend needs help, try:
+If the basic framebuffer path looks good, try the smoke test:
 
 ```bash
-SDL_VIDEODRIVER=RPI python3 fullscreen_test.py
-SDL_VIDEODRIVER=RPI python3 run_stringer_vstim.py
+python3 fullscreen_test.py
 ```
 
-The v0 script currently keeps the photodiode patch disabled by default. That is on
-purpose. Once the basic image path is confirmed on the Pi, we can either:
+## Photodiode patch
 
-- turn the patch back on in software, or
-- move to a precomputed raw-frame pipeline.
-
-## Image subset variables
-
-#### `N_IMAGES_TO_USE`
-
-Number of unique images selected from `IMAGE_DIR`.
+The first pass keeps the photodiode patch disabled by default so we can verify
+the screen path first. To enable it, set:
 
 ```python
-N_IMAGES_TO_USE = 5
+ENABLE_PHOTODIODE_PATCH = True
 ```
 
-Use a smaller number for the first display check. Suggested values:
+The helper functions already bake the patch into the session raw files.
 
-| Use case | Suggested value |
-|---|---:|
-| Display smoke test | 5 |
-| Hardware pilot | 20-50 |
-| 2P pilot | 100 |
-| Main decoding experiment | 200-300 |
+## Notes on the display backend
 
-## Output files
-
-Each run creates a new session folder:
-
-```text
-OUTPUT_ROOT / mouse_id / session_id /
-```
-
-Inside the session folder:
-
-- `selected_images.csv`
-- `planned_sequence.csv`
-- `event_log.csv`
-- `metadata.json`
-
-## Paper note
-
-The uploaded Nuñez-Ochoa et al. 2026 paper is useful as a stimulus-design reference.
-It confirms the 270-degree panorama origin of the Stringer-style stimuli and supports
-the center-crop decision for a one-screen setup. It is not especially useful as a runtime
-implementation guide for the Pi.
+The older pygame approach was a dead end for the headless behavior Pi.
+The rpg path is the one the lab code already uses for framebuffer display,
+and it is the right place to put this stimulus runner.
