@@ -42,7 +42,7 @@ ITI_DURATION_SEC = 0.75
 INITIAL_GRAY_SEC = 3.0
 FINAL_GRAY_SEC = 3.0
 
-ENABLE_PHOTODIODE_PATCH = False
+ENABLE_PHOTODIODE_PATCH = True
 PHOTODIODE_SIZE_PX = 120
 PHOTODIODE_MARGIN_PX = 0
 PHOTODIODE_ON_COLOR = (255, 255, 255)
@@ -332,6 +332,7 @@ def main():
     print("Planned sequence: %s" % planned_sequence_path)
     print("Event log: %s" % event_log_path)
     print("Metadata: %s" % metadata_path)
+    print("Photodiode patch: enabled on the top-right corner (white during stim, black during ITI).")
 
     selected_rows = []
     for index, image_path in enumerate(selected_pngs):
