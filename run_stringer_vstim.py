@@ -16,7 +16,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageOps
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 IMAGE_DIR_CANDIDATES = [
@@ -200,16 +200,13 @@ def patch_rect(screen_size):
 
 
 def build_canvas(image_path, screen_size, photodiode_on):
-    width, height = screen_size
     canvas = Image.new("RGB", screen_size, (SCREEN_BACKGROUND_GRAY,) * 3)
 
     if image_path is not None:
         with Image.open(image_path) as img:
             img = img.convert("RGB")
-            img.thumbnail(screen_size, Image.LANCZOS)
-            x = (width - img.width) // 2
-            y = (height - img.height) // 2
-            canvas.paste(img, (x, y))
+            img = ImageOps.fit(img, screen_size, method=Image.LANCZOS, centering=(0.5, 0.5))
+            canvas.paste(img, (0, 0))
 
     if ENABLE_PHOTODIODE_PATCH:
         draw = ImageDraw.Draw(canvas)
@@ -410,9 +407,12 @@ def main():
 
     print("Preparing session raw files...")
     stim_raw_paths, iti_raw_path = build_session_raw_cache(rpg, raw_cache_root, selected_pngs)
+    print("Session raw files ready. Starting visual stimulus playback...")
+    sys.stdout.flush()
     loaded_stim_raws = {}
 
     gpio = None
+    session_completed = False
     if USE_GPIO:
         gpio = setup_gpio()
 
@@ -434,6 +434,8 @@ def main():
                 },
                 EVENT_FIELDS,
             )
+            print("Stimulus playback is now active.")
+            sys.stdout.flush()
 
             for trial in trials:
                 stem = Path(trial["image_path"]).stem
@@ -493,6 +495,7 @@ def main():
                 },
                 EVENT_FIELDS,
             )
+            session_completed = True
 
     except KeyboardInterrupt:
         append_csv_row(
@@ -519,6 +522,11 @@ def main():
         metadata["planned_sequence_csv"] = str(planned_sequence_path)
         metadata["raw_cache_root"] = str(raw_cache_root)
         metadata_path.write_text(json.dumps(metadata, indent=2, sort_keys=True) + chr(10))
+        if session_completed:
+            print("Session finished. Files are in: %s" % session_root)
+        else:
+            print("Session stopped early. Partial files are in: %s" % session_root)
+        sys.stdout.flush()
 
     return 0
 
