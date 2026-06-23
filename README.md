@@ -14,10 +14,13 @@ run_stringer_vstim.py
 What the runtime does:
 
 - asks for mouse ID and optional session notes
+- asks for number of images and repeats, using the current defaults when you just press Enter
+- confirms the session settings and estimated playback time before starting
 - chooses a reproducible subset of Stringer center-crop PNGs
 - bakes session-specific `rpg` raw files at startup
 - displays each image fullscreen for a fixed duration
 - shows gray ITI between images
+- prints a terminal progress line with percent and ETA during playback
 - optionally bakes a photodiode patch into the frames
 - logs planned sequence, actual display timestamps, and metadata
 

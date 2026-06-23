@@ -117,18 +117,18 @@ def parse_image_id_from_filename(path):
     return None
 
 
-def select_image_subset(all_image_files):
-    if N_IMAGES_TO_USE is None:
+def select_image_subset(all_image_files, n_images_to_use):
+    if n_images_to_use is None:
         return list(all_image_files)
-    if N_IMAGES_TO_USE > len(all_image_files):
+    if n_images_to_use > len(all_image_files):
         raise RuntimeError(
-            "N_IMAGES_TO_USE=%d, but only %d PNGs were found." % (N_IMAGES_TO_USE, len(all_image_files))
+            "N_IMAGES_TO_USE=%d, but only %d PNGs were found." % (n_images_to_use, len(all_image_files))
         )
     rng = random.Random(IMAGE_SUBSET_SEED)
-    return sorted(rng.sample(list(all_image_files), N_IMAGES_TO_USE))
+    return sorted(rng.sample(list(all_image_files), n_images_to_use))
 
 
-def make_trial_sequence(selected_image_files):
+def make_trial_sequence(selected_image_files, n_repeats):
     if TRIAL_ORDER_SEED is None:
         seed = int(time.time_ns() % (2 ** 32))
     else:
@@ -136,7 +136,7 @@ def make_trial_sequence(selected_image_files):
 
     rng = random.Random(seed)
     base_trials = []
-    for repeat_idx in range(N_REPEATS):
+    for repeat_idx in range(n_repeats):
         for selected_index, path in enumerate(selected_image_files):
             image_id = parse_image_id_from_filename(path)
             base_trials.append(
@@ -294,6 +294,47 @@ def prompt_text(prompt):
         return ""
 
 
+def prompt_int_or_default(prompt, default_value, minimum=1):
+    raw = prompt_text("%s [%d]: " % (prompt, default_value)).strip()
+    if not raw:
+        return default_value
+    value = int(raw)
+    if value < minimum:
+        raise ValueError("%s must be at least %d" % (prompt, minimum))
+    return value
+
+
+def prompt_yes_no(prompt, default_yes=True):
+    suffix = "[Y/n]" if default_yes else "[y/N]"
+    raw = prompt_text("%s %s: " % (prompt, suffix)).strip().lower()
+    if not raw:
+        return default_yes
+    return raw in {"y", "yes"}
+
+
+def format_seconds(seconds):
+    seconds = max(0, int(round(seconds)))
+    hours, remainder = divmod(seconds, 3600)
+    minutes, secs = divmod(remainder, 60)
+    return "%02d:%02d:%02d" % (hours, minutes, secs)
+
+
+def estimate_playback_seconds(total_trials):
+    return INITIAL_GRAY_SEC + FINAL_GRAY_SEC + total_trials * (STIM_DURATION_SEC + ITI_DURATION_SEC)
+
+
+def print_progress(trial_number, total_trials, start_time):
+    elapsed = time.perf_counter() - start_time
+    per_trial = STIM_DURATION_SEC + ITI_DURATION_SEC
+    remaining_trials = max(0, total_trials - trial_number)
+    estimated_remaining = remaining_trials * per_trial + FINAL_GRAY_SEC
+    percent = 100.0 if total_trials == 0 else (trial_number / float(total_trials)) * 100.0
+    line = "Progress: %d/%d (%.1f%%) ETA %s" % (trial_number, total_trials, percent, format_seconds(estimated_remaining))
+    sys.stdout.write("\r" + line + " " * 8)
+    sys.stdout.flush()
+    return elapsed
+
+
 def main():
     print_environment()
     try:
@@ -306,13 +347,31 @@ def main():
     mouse_id_raw = prompt_text("Mouse ID: ")
     mouse_id = sanitize_text(mouse_id_raw) or "mouse"
     session_notes = prompt_text("Session notes, optional: ").strip()
-    session_stamp = utc_session_stamp()
-    session_id = "%s_%s" % (mouse_id, session_stamp)
+    n_images_to_use = prompt_int_or_default("Number of unique images to use", N_IMAGES_TO_USE)
+    n_repeats = prompt_int_or_default("Repeats per image", N_REPEATS)
 
     image_dir = resolve_image_dir()
     all_pngs = list_png_files(image_dir)
-    selected_pngs = select_image_subset(all_pngs)
-    trials, sequence_seed = make_trial_sequence(selected_pngs)
+    selected_pngs = select_image_subset(all_pngs, n_images_to_use)
+    trials, sequence_seed = make_trial_sequence(selected_pngs, n_repeats)
+    estimated_playback_sec = estimate_playback_seconds(len(trials))
+
+    print()
+    print("Session setup summary:")
+    print("  Mouse ID: %s" % (mouse_id_raw.strip() or mouse_id))
+    print("  Session notes, optional: %s" % session_notes)
+    print("  Number of unique images: %d" % len(selected_pngs))
+    print("  Repeats per image: %d" % n_repeats)
+    print("  Total trials: %d" % len(trials))
+    print("  Estimated playback time: %s" % format_seconds(estimated_playback_sec))
+    print("  Output folder: %s" % (OUTPUT_ROOT / mouse_id))
+
+    if not prompt_yes_no("Start this session", default_yes=True):
+        print("Session aborted before starting. No files were changed.")
+        return 0
+
+    session_stamp = utc_session_stamp()
+    session_id = "%s_%s" % (mouse_id, session_stamp)
 
     session_root = ensure_dir(OUTPUT_ROOT / mouse_id / session_id)
     raw_cache_root = ensure_dir(session_root / "raw_cache")
@@ -321,19 +380,11 @@ def main():
     planned_sequence_path = session_root / (session_id + "_planned_sequence.csv")
     metadata_path = session_root / (session_id + "_metadata.json")
 
-    print("Mouse ID: %s" % (mouse_id_raw.strip() or mouse_id))
-    print("Session notes, optional: %s" % session_notes)
     print("Session ID: %s" % session_id)
-    print("Resolved image directory: %s" % image_dir)
-    print("Images used: %d" % len(selected_pngs))
-    print("Repeats per image: %d" % N_REPEATS)
-    print("Total trials: %d" % len(trials))
     print("Selected images: %s" % selected_images_path)
     print("Planned sequence: %s" % planned_sequence_path)
     print("Event log: %s" % event_log_path)
     print("Metadata: %s" % metadata_path)
-    print("Photodiode patch: enabled on the top-right corner (white during stim, black during ITI).")
-
     selected_rows = []
     for index, image_path in enumerate(selected_pngs):
         image_id = parse_image_id_from_filename(image_path)
@@ -386,8 +437,8 @@ def main():
         "screen_background_gray": SCREEN_BACKGROUND_GRAY,
         "screen_colormode": SCREEN_COLORMODE,
         "refresh_rate_hz": REFRESH_RATE_HZ,
-        "n_images_to_use": N_IMAGES_TO_USE,
-        "n_repeats": N_REPEATS,
+        "n_images_to_use": n_images_to_use,
+        "n_repeats": n_repeats,
         "image_subset_seed": IMAGE_SUBSET_SEED,
         "trial_order_seed": TRIAL_ORDER_SEED,
         "resolved_trial_order_seed": sequence_seed,
@@ -438,12 +489,14 @@ def main():
             print("Stimulus playback is now active.")
             sys.stdout.flush()
 
-            for trial in trials:
+            playback_start = time.perf_counter()
+            for trial_index, trial in enumerate(trials, start=1):
                 stem = Path(trial["image_path"]).stem
                 if USE_GPIO:
                     ttl_pulse(gpio)
 
                 stim_perf = screen.display_raw(loaded_stim_raws[stem])
+                print_progress(trial_index, len(trials), playback_start)
                 append_csv_row(
                     event_log_path,
                     {
@@ -487,6 +540,8 @@ def main():
 
             screen.display_greyscale(SCREEN_BACKGROUND_GRAY)
             time.sleep(FINAL_GRAY_SEC)
+            sys.stdout.write("\n")
+            sys.stdout.flush()
             append_csv_row(
                 event_log_path,
                 {
