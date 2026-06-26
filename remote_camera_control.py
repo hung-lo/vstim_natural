@@ -122,9 +122,37 @@ def save_state(state):
 def load_state():
     if not STATE_FILE.exists():
         raise RuntimeError(
-            "No state file found: %s\nRun start first." % STATE_FILE
+            "No saved camera session state found at %s.\n"
+            "Run `python3 remote_camera_control.py start --mouse-id <mouse_id>` first, "
+            "or pass `--mouse-id` and `--session-id` to fetch/stop-fetch."
+            % STATE_FILE
         )
     return json.loads(STATE_FILE.read_text(encoding="utf-8"))
+
+
+def build_state_from_args(args):
+    if not getattr(args, "mouse_id", None):
+        raise RuntimeError(
+            "No saved camera session state found. Pass `--mouse-id` and `--session-id`, "
+            "or run `start` first."
+        )
+    if not getattr(args, "session_id", None):
+        raise RuntimeError(
+            "No saved camera session state found. Pass `--session-id` as well, "
+            "or run `start` first so the session ID is saved automatically."
+        )
+
+    paths = make_session_paths(args)
+    camera_host = resolve_camera_host(args)
+    return {
+        "created_utc": utc_iso_now(),
+        "camera_host": camera_host,
+        "framerate": getattr(args, "framerate", CAMERA_FRAMERATE),
+        "remote_camera_repo": getattr(args, "remote_camera_repo", REMOTE_CAMERA_REPO),
+        "remote_camera_start": getattr(args, "remote_camera_start", REMOTE_CAMERA_START),
+        "remote_camera_stop": getattr(args, "remote_camera_stop", REMOTE_CAMERA_STOP),
+        **paths,
+    }
 
 
 def resolve_camera_host(args, state=None):
@@ -231,7 +259,10 @@ def stop_camera(args, state=None):
 
 def fetch_camera(args, state=None):
     if state is None:
-        state = load_state()
+        try:
+            state = load_state()
+        except RuntimeError:
+            state = build_state_from_args(args)
 
     camera_host = resolve_camera_host(args, state)
     remote_video_dir = state["remote_video_dir"]
@@ -310,11 +341,16 @@ def build_parser():
     fetch.set_defaults(func=fetch_camera)
 
     stop_fetch = sub.add_parser("stop-fetch", parents=[common], help="Stop recording, then fetch files.")
+    stop_fetch.add_argument("--mouse-id", default=None, help="Mouse ID if no saved session state exists yet.")
+    stop_fetch.add_argument("--session-id", default=None, help="Session ID if no saved session state exists yet.")
     stop_fetch.add_argument("--remote-camera-stop", default=REMOTE_CAMERA_STOP)
     stop_fetch.add_argument("--ignore-stop-errors", action="store_true", default=False)
 
     def do_stop_fetch(args):
-        state = load_state()
+        try:
+            state = load_state()
+        except RuntimeError:
+            state = build_state_from_args(args)
         stop_camera(args, state)
         time.sleep(2.0)
         fetch_camera(args, state)
