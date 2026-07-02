@@ -70,7 +70,14 @@ def run_cmd(cmd, check=True, dry_run=False):
     print("+ " + " ".join(shlex.quote(x) for x in cmd))
     if dry_run:
         return subprocess.CompletedProcess(cmd, 0)
-    return subprocess.run(cmd, check=check, text=True)
+    try:
+        return subprocess.run(cmd, check=check, text=True, capture_output=True)
+    except subprocess.CalledProcessError as exc:
+        if exc.stdout:
+            print(exc.stdout, end="")
+        if exc.stderr:
+            print(exc.stderr, end="", file=sys.stderr)
+        raise
 
 
 def run_ssh(camera_host, remote_cmd, check=True, dry_run=False):
