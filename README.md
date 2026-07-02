@@ -5,10 +5,11 @@ This repo now uses the lab's `rpg` framebuffer path again, not pygame.
 That matters for the headless behavior Pi, because the screen is controlled
 directly from the Pi framebuffer rather than through a desktop/X11 session.
 
-Current entrypoint:
+Current entrypoints:
 
 ```text
 run_stringer_vstim.py
+run_stringer_vstim_cam.py
 ```
 
 What the runtime does:
@@ -22,6 +23,8 @@ What the runtime does:
 - shows gray ITI between images
 - prints a terminal progress line with percent and ETA during playback
 - optionally bakes a photodiode patch into the frames
+- writes sub-second unix timestamps in the session event logs
+- with the camera wrapper, starts/stops the remote camera and fetches files back to box 151
 - logs planned sequence, actual display timestamps, and metadata
 
 ## Expected paths on the Pi
@@ -47,6 +50,7 @@ The runtime expects:
 - `rpg` installed from the SjulsonLab rpg repository
 - `Pillow`
 - `RPi.GPIO` on the Pi if GPIO output is enabled
+- `ffmpeg` on box 151 if you want automatic `.h264` to `.mp4` conversion
 
 Example rpg install on the Pi:
 
@@ -81,6 +85,15 @@ If the basic framebuffer path looks good, try the smoke test:
 ```bash
 python3 fullscreen_test.py
 ```
+
+If you want camera recording plus automatic file transfer and conversion, use:
+
+```bash
+python3 run_stringer_vstim_cam.py
+```
+
+Keep `run_stringer_vstim.py` around as the plain no-camera runner and as the
+baseline path if you want to debug the display flow independently.
 
 ## Photodiode patch
 

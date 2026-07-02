@@ -55,6 +55,7 @@ TTL_PULSE_SEC = 0.005
 
 EVENT_FIELDS = [
     "utc_iso",
+    "unix_time_utc_sec",
     "event_type",
     "trial_index",
     "repeat_number",
@@ -186,6 +187,8 @@ def write_csv(path, rows, fieldnames):
 def append_csv_row(path, row, fieldnames):
     ensure_dir(path.parent)
     file_exists = path.exists()
+    row = dict(row)
+    row.setdefault("unix_time_utc_sec", "%.6f" % time.time())
     with path.open("a", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=fieldnames)
         if not file_exists:
