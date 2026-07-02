@@ -12,6 +12,7 @@ import shlex
 import subprocess
 import sys
 import time
+import threading
 from pathlib import Path
 
 import run_stringer_vstim as base
@@ -21,9 +22,25 @@ OUTPUT_ROOT = base.OUTPUT_ROOT
 CAMERA_CONTROL_SCRIPT = PROJECT_ROOT / "remote_camera_control.py"
 
 
-def run_camera_control(args):
+def _log_completed_process(proc, label):
+    stdout, stderr = proc.communicate()
+    if stdout:
+        print(stdout, end="")
+    if stderr:
+        print(stderr, end="", file=sys.stderr)
+    if proc.returncode not in (0, None):
+        print("%s exited with code %s" % (label, proc.returncode), file=sys.stderr)
+
+
+def run_camera_control(args, background=False):
     cmd = [sys.executable, str(CAMERA_CONTROL_SCRIPT)] + list(args)
     print("+ " + " ".join(shlex.quote(x) for x in cmd))
+    if background:
+        proc = subprocess.Popen(cmd, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        thread = threading.Thread(target=_log_completed_process, args=(proc, "camera control"), daemon=True)
+        thread.start()
+        return proc
+
     try:
         result = subprocess.run(cmd, check=True, text=True, capture_output=True)
     except subprocess.CalledProcessError as exc:
@@ -42,7 +59,7 @@ def run_camera_control(args):
 
 def start_camera_recording(mouse_id, session_id):
     print("Starting remote camera recording...")
-    run_camera_control(["start", "--mouse-id", mouse_id, "--session-id", session_id])
+    return run_camera_control(["start", "--mouse-id", mouse_id, "--session-id", session_id], background=True)
 
 
 def stop_camera_recording():
