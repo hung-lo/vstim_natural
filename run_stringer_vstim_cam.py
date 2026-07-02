@@ -67,6 +67,11 @@ def stop_camera_recording():
     run_camera_control(["stop"])
 
 
+def fetch_camera_recording():
+    print("Fetching camera files to box 151...")
+    run_camera_control(["fetch"])
+
+
 def main():
     base.print_environment()
     try:
@@ -325,6 +330,8 @@ def main():
             if base.prompt_yes_no("Stop camera recording now", default_yes=False):
                 try:
                     stop_camera_recording()
+                    time.sleep(2.0)
+                    fetch_camera_recording()
                     camera_stopped = True
                 except Exception as exc:
                     print("ERROR stopping camera: %s" % exc, file=sys.stderr)

@@ -39,12 +39,13 @@ REMOTE_CAMERA_START = "/home/pi/RPi4_behavior_boxes/video_acquisition/start_acqu
 REMOTE_CAMERA_STOP = "/home/pi/RPi4_behavior_boxes/video_acquisition/stop_acquisition.sh"
 
 REMOTE_VIDEO_ROOT = "/home/pi/stim_logs"
-LOCAL_VIDEO_ROOT = "stim_logs"
+LOCAL_VIDEO_ROOT = Path.home() / "stim_logs"
 
 CAMERA_FRAMERATE = 30
 
 PROJECT_ROOT = Path(__file__).resolve().parent
-STATE_FILE = PROJECT_ROOT / "stim_logs" / ".last_remote_camera_session.json"
+STATE_FILE = LOCAL_VIDEO_ROOT / ".last_remote_camera_session.json"
+LEGACY_STATE_FILE = PROJECT_ROOT / "stim_logs" / ".last_remote_camera_session.json"
 
 
 def utc_iso_now():
@@ -127,14 +128,23 @@ def save_state(state):
 
 
 def load_state():
-    if not STATE_FILE.exists():
+    state_file = STATE_FILE if STATE_FILE.exists() else LEGACY_STATE_FILE if LEGACY_STATE_FILE.exists() else None
+    if state_file is None:
         raise RuntimeError(
             "No saved camera session state found at %s.\n"
+            "Also checked legacy location %s.\n"
             "Run `python3 remote_camera_control.py start --mouse-id <mouse_id>` first, "
             "or pass `--mouse-id` and `--session-id` to fetch/stop-fetch."
-            % STATE_FILE
+            % (STATE_FILE, LEGACY_STATE_FILE)
         )
-    return json.loads(STATE_FILE.read_text(encoding="utf-8"))
+    state = json.loads(state_file.read_text(encoding="utf-8"))
+    if state_file == LEGACY_STATE_FILE and state.get("mouse_id") and state.get("session_id"):
+        mouse_id = state["mouse_id"]
+        session_id = state["session_id"]
+        local_session_dir = (LOCAL_VIDEO_ROOT / mouse_id / session_id).resolve()
+        state["local_session_dir"] = str(local_session_dir)
+        state["local_video_dir"] = str(local_session_dir / "video")
+    return state
 
 
 def build_state_from_args(args):
@@ -177,7 +187,7 @@ def make_session_paths(args):
 
     session_id = sanitize_id(args.session_id) if args.session_id else "%s_%s" % (mouse_id, utc_label())
 
-    local_session_dir = (PROJECT_ROOT / LOCAL_VIDEO_ROOT / mouse_id / session_id).resolve()
+    local_session_dir = (LOCAL_VIDEO_ROOT / mouse_id / session_id).resolve()
     local_video_dir = local_session_dir / "video"
 
     remote_session_dir = "%s/%s/%s" % (REMOTE_VIDEO_ROOT, mouse_id, session_id)
