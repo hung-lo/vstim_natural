@@ -207,6 +207,7 @@ def start_camera(args):
     append_event(local_video_dir, "camera_start_requested", state)
 
     remote_log = "%s/camera_acquisition.log" % paths["remote_video_dir"]
+    safe_start_pattern = "[v]ideo_acquisition/start_acquisition.py"
 
     remote_cmd = (
         "mkdir -p %s && "
@@ -215,7 +216,7 @@ def start_camera(args):
         "nohup python3 %s %s %d >> %s 2>&1 &"
         % (
             shlex.quote(paths["remote_video_dir"]),
-            shlex.quote("video_acquisition/start_acquisition.py"),
+            shlex.quote(safe_start_pattern),
             shlex.quote(args.remote_camera_repo),
             shlex.quote(args.remote_camera_start),
             shlex.quote(paths["remote_base_path"]),
@@ -298,11 +299,13 @@ def fetch_camera(args, state=None):
 def status_camera(args):
     state = load_state() if STATE_FILE.exists() else None
     camera_host = resolve_camera_host(args, state)
+    safe_start_pattern = "[v]ideo_acquisition/start_acquisition.py"
     remote_cmd = (
         "echo '--- camera acquisition processes ---'; "
-        "pgrep -af 'start_acquisition.py' || true; "
+        "pgrep -af %s || true; "
         "echo '--- recent camera logs ---'; "
         "find /home/pi/stim_logs -name 'camera_acquisition.log' -type f 2>/dev/null | tail -n 5 || true"
+        % shlex.quote(safe_start_pattern)
     )
     run_ssh(camera_host, remote_cmd, dry_run=args.dry_run)
 
