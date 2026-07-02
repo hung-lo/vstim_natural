@@ -101,16 +101,17 @@ def main():
     print("  Repeats per image: %d" % n_repeats)
     print("  Total trials: %d" % len(trials))
     print("  Estimated playback time: %s" % base.format_seconds(estimated_playback_sec))
-    print("  Output folder: %s" % (OUTPUT_ROOT / mouse_id))
+    print("  Output folder root: %s" % OUTPUT_ROOT)
+    print("  Session folder name: %s" % base.make_session_name(mouse_id, "YYYYMMDDThhmmssZ"))
 
     if not base.prompt_yes_no("Start this session", default_yes=True):
         print("Session aborted before starting. No files were changed.")
         return 0
 
     session_stamp = base.utc_session_stamp()
-    session_id = "%s_%s" % (mouse_id, session_stamp)
+    session_id = base.make_session_name(mouse_id, session_stamp)
 
-    session_root = base.ensure_dir(OUTPUT_ROOT / mouse_id / session_id)
+    session_root = base.ensure_dir(OUTPUT_ROOT / session_id)
     raw_cache_root = base.ensure_dir(session_root / "raw_cache")
     event_log_path = session_root / (session_id + "_event_log.csv")
     selected_images_path = session_root / (session_id + "_selected_images.csv")

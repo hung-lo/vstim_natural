@@ -24,6 +24,7 @@ You can still override the host manually with:
 import argparse
 import csv
 import json
+import shutil
 import shlex
 import subprocess
 import sys
@@ -39,7 +40,8 @@ REMOTE_CAMERA_START = "/home/pi/RPi4_behavior_boxes/video_acquisition/start_acqu
 REMOTE_CAMERA_STOP = "/home/pi/RPi4_behavior_boxes/video_acquisition/stop_acquisition.sh"
 
 REMOTE_VIDEO_ROOT = "/home/pi/stim_logs"
-LOCAL_VIDEO_ROOT = Path.home() / "stim_logs"
+LOCAL_VIDEO_ROOT = Path("/mnt/hd")
+SESSION_NAME_SUFFIX = "vstim_natural"
 
 CAMERA_FRAMERATE = 30
 
@@ -54,6 +56,10 @@ def utc_iso_now():
 
 def utc_label():
     return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+
+
+def make_session_name(mouse_id, session_stamp):
+    return "%s_%s_%s" % (mouse_id, session_stamp, SESSION_NAME_SUFFIX)
 
 
 def sanitize_id(text):
@@ -101,6 +107,50 @@ def run_rsync(camera_host, remote_dir, local_dir, dry_run=False):
     )
 
 
+def convert_h264_to_mp4(local_video_dir, framerate=CAMERA_FRAMERATE, dry_run=False):
+    ffmpeg = shutil.which("ffmpeg")
+    if ffmpeg is None:
+        print("ffmpeg not found; skipping mp4 conversion.")
+        return
+
+    h264_files = sorted(local_video_dir.glob("*.h264"))
+    if not h264_files:
+        print("No .h264 files found for mp4 conversion.")
+        return
+
+    for input_path in h264_files:
+        output_path = input_path.with_suffix(".mp4")
+        if output_path.exists():
+            print("MP4 already exists, skipping: %s" % output_path)
+            continue
+
+        cmd = [
+            ffmpeg,
+            "-y",
+            "-framerate",
+            str(framerate),
+            "-i",
+            str(input_path),
+            "-c:v",
+            "copy",
+            "-movflags",
+            "+faststart",
+            str(output_path),
+        ]
+        print("+ " + " ".join(shlex.quote(x) for x in cmd))
+        if dry_run:
+            continue
+        try:
+            subprocess.run(cmd, check=True, text=True, capture_output=True)
+        except subprocess.CalledProcessError as exc:
+            if exc.stdout:
+                print(exc.stdout, end="")
+            if exc.stderr:
+                print(exc.stderr, end="", file=sys.stderr)
+            raise
+        print("Converted %s -> %s" % (input_path.name, output_path.name))
+
+
 def append_event(local_video_dir, event, details=None):
     local_video_dir.mkdir(parents=True, exist_ok=True)
     path = local_video_dir / "camera_control_events.csv"
@@ -139,9 +189,8 @@ def load_state():
         )
     state = json.loads(state_file.read_text(encoding="utf-8"))
     if state_file == LEGACY_STATE_FILE and state.get("mouse_id") and state.get("session_id"):
-        mouse_id = state["mouse_id"]
         session_id = state["session_id"]
-        local_session_dir = (LOCAL_VIDEO_ROOT / mouse_id / session_id).resolve()
+        local_session_dir = (LOCAL_VIDEO_ROOT / session_id).resolve()
         state["local_session_dir"] = str(local_session_dir)
         state["local_video_dir"] = str(local_session_dir / "video")
     return state
@@ -185,12 +234,12 @@ def make_session_paths(args):
     if not mouse_id:
         raise RuntimeError("mouse ID cannot be empty")
 
-    session_id = sanitize_id(args.session_id) if args.session_id else "%s_%s" % (mouse_id, utc_label())
+    session_id = sanitize_id(args.session_id) if args.session_id else make_session_name(mouse_id, utc_label())
 
-    local_session_dir = (LOCAL_VIDEO_ROOT / mouse_id / session_id).resolve()
+    local_session_dir = (LOCAL_VIDEO_ROOT / session_id).resolve()
     local_video_dir = local_session_dir / "video"
 
-    remote_session_dir = "%s/%s/%s" % (REMOTE_VIDEO_ROOT, mouse_id, session_id)
+    remote_session_dir = "%s/%s" % (REMOTE_VIDEO_ROOT, session_id)
     remote_video_dir = "%s/video" % remote_session_dir
     remote_base_path = "%s/%s" % (remote_video_dir, session_id)
 
@@ -261,7 +310,7 @@ def stop_camera(args, state=None):
             state = {}
 
     camera_host = resolve_camera_host(args, state)
-    local_video_dir = Path(state.get("local_video_dir", PROJECT_ROOT / LOCAL_VIDEO_ROOT / "unknown" / "video"))
+    local_video_dir = Path(state.get("local_video_dir", LOCAL_VIDEO_ROOT / "unknown" / "video"))
     local_video_dir.mkdir(parents=True, exist_ok=True)
 
     append_event(local_video_dir, "camera_stop_requested", {"camera_host": camera_host})
@@ -304,6 +353,24 @@ def fetch_camera(args, state=None):
         {
             "camera_host": camera_host,
             "remote_video_dir": remote_video_dir,
+            "local_video_dir": str(local_video_dir),
+        },
+    )
+
+    append_event(
+        local_video_dir,
+        "camera_conversion_requested",
+        {
+            "camera_host": camera_host,
+            "local_video_dir": str(local_video_dir),
+        },
+    )
+    convert_h264_to_mp4(local_video_dir, framerate=state.get("framerate", CAMERA_FRAMERATE), dry_run=args.dry_run)
+    append_event(
+        local_video_dir,
+        "camera_conversion_returned",
+        {
+            "camera_host": camera_host,
             "local_video_dir": str(local_video_dir),
         },
     )

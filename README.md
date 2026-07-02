@@ -37,7 +37,7 @@ The script looks for the PNG folder in these places:
 Session output goes to:
 
 ```text
-~/stim_logs/<mouse_id>/<session_id>/
+/mnt/hd/<mouse_id>_<YYYYMMDDThhmmssZ>_vstim_natural/
 ```
 
 ## Dependencies
@@ -84,8 +84,8 @@ python3 fullscreen_test.py
 
 ## Photodiode patch
 
-The first pass keeps the photodiode patch disabled by default so we can verify
-the screen path first. To enable it, set:
+The photodiode patch is built into the session raw files. The current default
+patch is smaller than the first pass version. To adjust it, set:
 
 ```python
 ENABLE_PHOTODIODE_PATCH = True

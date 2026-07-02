@@ -24,7 +24,8 @@ IMAGE_DIR_CANDIDATES = [
     Path.home() / "vstim_natural" / "stringer_natimg2800_center_crop_png",
     Path.home() / "stringer_natimg2800_center_crop_png",
 ]
-OUTPUT_ROOT = Path.home() / "stim_logs"
+OUTPUT_ROOT = Path("/mnt/hd")
+SESSION_NAME_SUFFIX = "vstim_natural"
 
 SCREEN_RESOLUTION = (1024, 600)
 SCREEN_BACKGROUND_GRAY = 127
@@ -43,7 +44,7 @@ INITIAL_GRAY_SEC = 3.0
 FINAL_GRAY_SEC = 3.0
 
 ENABLE_PHOTODIODE_PATCH = True
-PHOTODIODE_SIZE_PX = 160
+PHOTODIODE_SIZE_PX = 120
 PHOTODIODE_MARGIN_PX = 0
 PHOTODIODE_ON_COLOR = (255, 255, 255)
 PHOTODIODE_OFF_COLOR = (0, 0, 0)
@@ -86,6 +87,10 @@ def utc_iso_now():
 
 def utc_session_stamp():
     return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+
+
+def make_session_name(mouse_id, session_stamp):
+    return "%s_%s_%s" % (mouse_id, session_stamp, SESSION_NAME_SUFFIX)
 
 
 def ensure_dir(path):
@@ -364,16 +369,17 @@ def main():
     print("  Repeats per image: %d" % n_repeats)
     print("  Total trials: %d" % len(trials))
     print("  Estimated playback time: %s" % format_seconds(estimated_playback_sec))
-    print("  Output folder: %s" % (OUTPUT_ROOT / mouse_id))
+    print("  Output folder root: %s" % OUTPUT_ROOT)
+    print("  Session folder name: %s" % make_session_name(mouse_id, "YYYYMMDDThhmmssZ"))
 
     if not prompt_yes_no("Start this session", default_yes=True):
         print("Session aborted before starting. No files were changed.")
         return 0
 
     session_stamp = utc_session_stamp()
-    session_id = "%s_%s" % (mouse_id, session_stamp)
+    session_id = make_session_name(mouse_id, session_stamp)
 
-    session_root = ensure_dir(OUTPUT_ROOT / mouse_id / session_id)
+    session_root = ensure_dir(OUTPUT_ROOT / session_id)
     raw_cache_root = ensure_dir(session_root / "raw_cache")
     event_log_path = session_root / (session_id + "_event_log.csv")
     selected_images_path = session_root / (session_id + "_selected_images.csv")
