@@ -215,15 +215,13 @@ def start_camera(args):
 
     remote_log = "%s/camera_acquisition.log" % paths["remote_video_dir"]
     safe_start_pattern = "[v]ideo_acquisition/start_acquisition.py"
-
-    remote_cmd = (
+    cleanup_cmd = "pkill -f %s || true" % shlex.quote(safe_start_pattern)
+    launch_cmd = (
         "mkdir -p %s && "
-        "pkill -f %s || true; "
         "cd %s && "
         "nohup python3 %s %s %d >> %s 2>&1 &"
         % (
             shlex.quote(paths["remote_video_dir"]),
-            shlex.quote(safe_start_pattern),
             shlex.quote(args.remote_camera_repo),
             shlex.quote(args.remote_camera_start),
             shlex.quote(paths["remote_base_path"]),
@@ -232,7 +230,8 @@ def start_camera(args):
         )
     )
 
-    run_ssh(camera_host, remote_cmd, dry_run=args.dry_run)
+    run_ssh(camera_host, cleanup_cmd, dry_run=args.dry_run)
+    run_ssh(camera_host, launch_cmd, dry_run=args.dry_run)
 
     append_event(local_video_dir, "camera_start_returned", state)
     save_state(state)
