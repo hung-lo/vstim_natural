@@ -27,6 +27,15 @@ What the runtime does:
 - with the camera wrapper, starts/stops the remote camera and fetches files back to box 151
 - logs planned sequence, actual display timestamps, and metadata
 
+## Default timing
+
+The current default stimulus timing is:
+
+- image on-screen time: `0.5` seconds
+- ITI time: `0.75` seconds
+- initial gray screen: `3.0` seconds
+- final gray screen: `3.0` seconds
+
 ## Expected paths on the Pi
 
 The script looks for the PNG folder in these places:
