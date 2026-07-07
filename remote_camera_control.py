@@ -14,6 +14,7 @@ Typical use on the behavior Pi:
     source .venv/bin/activate
 
     python3 remote_camera_control.py start --mouse-id testmouse
+    python3 remote_camera_control.py preview
     python3 remote_camera_control.py status
     python3 remote_camera_control.py stop-fetch
 
@@ -38,6 +39,8 @@ DEFAULT_CAMERA_HOST = "pi@192.168.1.152"
 REMOTE_CAMERA_REPO = "/home/pi/RPi4_behavior_boxes"
 REMOTE_CAMERA_START = "/home/pi/RPi4_behavior_boxes/video_acquisition/start_acquisition.py"
 REMOTE_CAMERA_STOP = "/home/pi/RPi4_behavior_boxes/video_acquisition/stop_acquisition.sh"
+REMOTE_CAMERA_PREVIEW_LOG = "/home/pi/stim_logs/camera_preview.log"
+REMOTE_CAMERA_PREVIEW_PID_FILE = "/tmp/remote_camera_preview.pid"
 
 REMOTE_VIDEO_ROOT = "/home/pi/stim_logs"
 LOCAL_VIDEO_ROOT = Path("/mnt/hd")
@@ -323,6 +326,49 @@ def stop_camera(args, state=None):
     return state
 
 
+def preview_camera(args):
+    camera_host = resolve_camera_host(args)
+    preview_cmd = (
+        "set -e; "
+        "cam=$(command -v rpicam-hello || command -v libcamera-hello); "
+        "if [ -z \"$cam\" ]; then echo 'No rpicam-hello or libcamera-hello found' >&2; exit 1; fi; "
+        "mkdir -p /home/pi/stim_logs; "
+        "nohup \"$cam\" -t 0 --fullscreen >%s 2>&1 & echo $! > %s"
+        % (shlex.quote(REMOTE_CAMERA_PREVIEW_LOG), shlex.quote(REMOTE_CAMERA_PREVIEW_PID_FILE))
+    )
+    stop_cmd = (
+        "if [ -f %s ]; then "
+        "pid=$(cat %s); "
+        "kill \"$pid\" 2>/dev/null || true; "
+        "sleep 0.5; "
+        "kill -9 \"$pid\" 2>/dev/null || true; "
+        "rm -f %s; "
+        "fi"
+        % (
+            shlex.quote(REMOTE_CAMERA_PREVIEW_PID_FILE),
+            shlex.quote(REMOTE_CAMERA_PREVIEW_PID_FILE),
+            shlex.quote(REMOTE_CAMERA_PREVIEW_PID_FILE),
+        )
+    )
+
+    print("Starting remote camera preview on %s..." % camera_host)
+    run_ssh(camera_host, preview_cmd, dry_run=args.dry_run)
+    print("Preview started. Type y and Enter to stop it.")
+    if not args.dry_run:
+        while True:
+            try:
+                response = input("> ").strip().lower()
+            except EOFError:
+                response = "y"
+            if response == "y":
+                break
+            print("Preview still running. Type y and Enter to stop.")
+        run_ssh(camera_host, stop_cmd, dry_run=args.dry_run)
+        print("Preview stopped.")
+    else:
+        print("Dry run finished; preview was not actually started.")
+
+
 def fetch_camera(args, state=None):
     if state is None:
         try:
@@ -425,6 +471,9 @@ def build_parser():
 
     fetch = sub.add_parser("fetch", parents=[common], help="Fetch last remote camera files with rsync.")
     fetch.set_defaults(func=fetch_camera)
+
+    preview = sub.add_parser("preview", parents=[common], help="Start a live camera preview, then stop it when you type y.")
+    preview.set_defaults(func=preview_camera)
 
     stop_fetch = sub.add_parser("stop-fetch", parents=[common], help="Stop recording, then fetch files.")
     stop_fetch.add_argument("--mouse-id", default=None, help="Mouse ID if no saved session state exists yet.")
