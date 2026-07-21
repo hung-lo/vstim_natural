@@ -238,54 +238,16 @@ def main():
                 print("Stimulus playback is now active.")
                 sys.stdout.flush()
 
-                playback_start = time.perf_counter()
-                for trial_index, trial in enumerate(trials, start=1):
-                    stem = Path(trial["image_path"]).stem
-                    if base.USE_GPIO:
-                        base.ttl_pulse(gpio)
-
-                    stim_perf = screen.display_raw(loaded_stim_raws[stem])
-                    base.print_progress(trial_index, len(trials), playback_start)
-                    base.append_csv_row(
-                        event_log_path,
-                        {
-                            "utc_iso": base.utc_iso_now(),
-                            "event_type": "stim_on",
-                            "trial_index": trial["trial_index"],
-                            "repeat_number": trial["repeat_number"],
-                            "image_index": trial["image_index"],
-                            "image_id": trial["image_id"],
-                            "image_filename": trial["image_filename"],
-                            "raw_path": str(stim_raw_paths[stem]),
-                            "planned_duration_sec": base.STIM_DURATION_SEC,
-                            "start_time_unix": getattr(stim_perf, "start_time", ""),
-                            "mean_interframe_us": getattr(stim_perf, "mean_interframe", ""),
-                            "stddev_interframe_us": getattr(stim_perf, "stddev_interframe", ""),
-                            "notes": "",
-                        },
-                        base.EVENT_FIELDS,
-                    )
-
-                    iti_perf = screen.display_raw(iti_raw)
-                    base.append_csv_row(
-                        event_log_path,
-                        {
-                            "utc_iso": base.utc_iso_now(),
-                            "event_type": "iti_on",
-                            "trial_index": trial["trial_index"],
-                            "repeat_number": trial["repeat_number"],
-                            "image_index": trial["image_index"],
-                            "image_id": trial["image_id"],
-                            "image_filename": trial["image_filename"],
-                            "raw_path": str(iti_raw_path),
-                            "planned_duration_sec": base.ITI_DURATION_SEC,
-                            "start_time_unix": getattr(iti_perf, "start_time", ""),
-                            "mean_interframe_us": getattr(iti_perf, "mean_interframe", ""),
-                            "stddev_interframe_us": getattr(iti_perf, "stddev_interframe", ""),
-                            "notes": "",
-                        },
-                        base.EVENT_FIELDS,
-                    )
+                base.run_trial_sequence(
+                    screen,
+                    trials,
+                    loaded_stim_raws,
+                    iti_raw,
+                    stim_raw_paths,
+                    iti_raw_path,
+                    event_log_path,
+                    gpio=gpio if base.USE_GPIO else None,
+                )
 
                 screen.display_greyscale(base.SCREEN_BACKGROUND_GRAY)
                 time.sleep(base.FINAL_GRAY_SEC)

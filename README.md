@@ -23,9 +23,9 @@ What the runtime does:
 - shows gray ITI between images
 - prints a terminal progress line with percent and ETA during playback
 - optionally bakes a photodiode patch into the frames
-- writes sub-second unix timestamps in the session event logs
+- logs display-request timestamps for `stim_on` and `iti_on` while the photodiode remains the ground truth for physical onset
 - with the camera wrapper, starts/stops the remote camera and fetches files back to box 151
-- logs planned sequence, actual display timestamps, and metadata
+- logs planned sequence, request timestamps, and metadata
 
 ## Default timing
 

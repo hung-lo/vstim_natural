@@ -64,6 +64,12 @@ EVENT_FIELDS = [
     "image_filename",
     "raw_path",
     "planned_duration_sec",
+    "display_request_unix_ns",
+    "display_return_unix_ns",
+    "display_return_utc_iso",
+    "display_request_perf_counter_ns",
+    "display_return_perf_counter_ns",
+    "display_call_duration_sec",
     "start_time_unix",
     "mean_interframe_us",
     "stddev_interframe_us",
@@ -82,8 +88,36 @@ def sanitize_text(text):
     return "".join(cleaned)
 
 
+def unix_ns_to_iso(unix_ns):
+    """Convert integer Unix nanoseconds to an ISO-8601 UTC string."""
+    unix_ns = int(unix_ns)
+    seconds, nanoseconds = divmod(unix_ns, 1_000_000_000)
+    dt = datetime.fromtimestamp(seconds, timezone.utc)
+    return "%s.%09d+00:00" % (
+        dt.strftime("%Y-%m-%dT%H:%M:%S"),
+        nanoseconds,
+    )
+
+
+def unix_ns_to_seconds_string(unix_ns):
+    """Return an exact decimal Unix-seconds string with nine digits."""
+    unix_ns = int(unix_ns)
+    seconds, nanoseconds = divmod(unix_ns, 1_000_000_000)
+    return "%d.%09d" % (seconds, nanoseconds)
+
+
+def capture_timestamp():
+    """Capture one absolute UTC timestamp and return all representations."""
+    unix_ns = time.time_ns()
+    return {
+        "unix_ns": unix_ns,
+        "unix_sec": unix_ns_to_seconds_string(unix_ns),
+        "utc_iso": unix_ns_to_iso(unix_ns),
+    }
+
+
 def utc_iso_now():
-    return datetime.now(timezone.utc).isoformat()
+    return unix_ns_to_iso(time.time_ns())
 
 
 def utc_session_stamp():
@@ -188,7 +222,10 @@ def append_csv_row(path, row, fieldnames):
     ensure_dir(path.parent)
     file_exists = path.exists()
     row = dict(row)
-    row.setdefault("unix_time_utc_sec", "%.6f" % time.time())
+    if not row.get("utc_iso") or not row.get("unix_time_utc_sec"):
+        captured = capture_timestamp()
+        row["utc_iso"] = captured["utc_iso"]
+        row["unix_time_utc_sec"] = captured["unix_sec"]
     with path.open("a", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=fieldnames)
         if not file_exists:
@@ -247,6 +284,90 @@ def convert_canvas_to_rpg_raw(rpg_module, canvas, raw_path, duration_sec):
             except OSError:
                 pass
     return raw_path
+
+
+def display_raw_with_timing(screen, raw):
+    """
+    Call the blocking RPG display function while recording request and return timestamps.
+
+    The request timestamp is captured immediately before display_raw().
+    It represents the RPi software request, not physical monitor onset.
+    """
+    request = capture_timestamp()
+    request_perf_ns = time.perf_counter_ns()
+
+    perf = screen.display_raw(raw)
+
+    return_perf_ns = time.perf_counter_ns()
+    returned = capture_timestamp()
+
+    return perf, {
+        "request_unix_ns": request["unix_ns"],
+        "request_unix_sec": request["unix_sec"],
+        "request_utc_iso": request["utc_iso"],
+        "return_unix_ns": returned["unix_ns"],
+        "return_unix_sec": returned["unix_sec"],
+        "return_utc_iso": returned["utc_iso"],
+        "request_perf_counter_ns": request_perf_ns,
+        "return_perf_counter_ns": return_perf_ns,
+        "duration_sec": (return_perf_ns - request_perf_ns) / 1_000_000_000.0,
+    }
+
+
+def make_display_event_row(event_type, trial, raw_path, planned_duration_sec, perf, timing):
+    return {
+        "utc_iso": timing["request_utc_iso"],
+        "unix_time_utc_sec": timing["request_unix_sec"],
+        "event_type": event_type,
+        "trial_index": trial["trial_index"],
+        "repeat_number": trial["repeat_number"],
+        "image_index": trial["image_index"],
+        "image_id": trial["image_id"],
+        "image_filename": trial["image_filename"],
+        "raw_path": str(raw_path),
+        "planned_duration_sec": planned_duration_sec,
+        "display_request_unix_ns": timing["request_unix_ns"],
+        "display_return_unix_ns": timing["return_unix_ns"],
+        "display_return_utc_iso": timing["return_utc_iso"],
+        "display_request_perf_counter_ns": timing["request_perf_counter_ns"],
+        "display_return_perf_counter_ns": timing["return_perf_counter_ns"],
+        "display_call_duration_sec": "%.9f" % timing["duration_sec"],
+        "start_time_unix": getattr(perf, "start_time", ""),
+        "mean_interframe_us": getattr(perf, "mean_interframe", ""),
+        "stddev_interframe_us": getattr(perf, "stddev_interframe", ""),
+        "notes": "",
+    }
+
+
+def run_trial_sequence(screen, trials, loaded_stim_raws, iti_raw, stim_raw_paths, iti_raw_path, event_log_path, gpio=None):
+    playback_start = time.perf_counter()
+    for trial_index, trial in enumerate(trials, start=1):
+        stem = Path(trial["image_path"]).stem
+        if gpio is not None:
+            ttl_pulse(gpio)
+
+        stim_perf, stim_timing = display_raw_with_timing(screen, loaded_stim_raws[stem])
+        iti_perf, iti_timing = display_raw_with_timing(screen, iti_raw)
+
+        stim_row = make_display_event_row(
+            "stim_on",
+            trial,
+            stim_raw_paths[stem],
+            STIM_DURATION_SEC,
+            stim_perf,
+            stim_timing,
+        )
+        iti_row = make_display_event_row(
+            "iti_on",
+            trial,
+            iti_raw_path,
+            ITI_DURATION_SEC,
+            iti_perf,
+            iti_timing,
+        )
+        append_csv_row(event_log_path, stim_row, EVENT_FIELDS)
+        append_csv_row(event_log_path, iti_row, EVENT_FIELDS)
+        print_progress(trial_index, len(trials), playback_start)
 
 
 def build_session_raw_cache(rpg_module, session_raw_dir, selected_image_files):
@@ -498,54 +619,16 @@ def main():
             print("Stimulus playback is now active.")
             sys.stdout.flush()
 
-            playback_start = time.perf_counter()
-            for trial_index, trial in enumerate(trials, start=1):
-                stem = Path(trial["image_path"]).stem
-                if USE_GPIO:
-                    ttl_pulse(gpio)
-
-                stim_perf = screen.display_raw(loaded_stim_raws[stem])
-                print_progress(trial_index, len(trials), playback_start)
-                append_csv_row(
-                    event_log_path,
-                    {
-                        "utc_iso": utc_iso_now(),
-                        "event_type": "stim_on",
-                        "trial_index": trial["trial_index"],
-                        "repeat_number": trial["repeat_number"],
-                        "image_index": trial["image_index"],
-                        "image_id": trial["image_id"],
-                        "image_filename": trial["image_filename"],
-                        "raw_path": str(stim_raw_paths[stem]),
-                        "planned_duration_sec": STIM_DURATION_SEC,
-                        "start_time_unix": getattr(stim_perf, "start_time", ""),
-                        "mean_interframe_us": getattr(stim_perf, "mean_interframe", ""),
-                        "stddev_interframe_us": getattr(stim_perf, "stddev_interframe", ""),
-                        "notes": "",
-                    },
-                    EVENT_FIELDS,
-                )
-
-                iti_perf = screen.display_raw(iti_raw)
-                append_csv_row(
-                    event_log_path,
-                    {
-                        "utc_iso": utc_iso_now(),
-                        "event_type": "iti_on",
-                        "trial_index": trial["trial_index"],
-                        "repeat_number": trial["repeat_number"],
-                        "image_index": trial["image_index"],
-                        "image_id": trial["image_id"],
-                        "image_filename": trial["image_filename"],
-                        "raw_path": str(iti_raw_path),
-                        "planned_duration_sec": ITI_DURATION_SEC,
-                        "start_time_unix": getattr(iti_perf, "start_time", ""),
-                        "mean_interframe_us": getattr(iti_perf, "mean_interframe", ""),
-                        "stddev_interframe_us": getattr(iti_perf, "stddev_interframe", ""),
-                        "notes": "",
-                    },
-                    EVENT_FIELDS,
-                )
+            run_trial_sequence(
+                screen,
+                trials,
+                loaded_stim_raws,
+                iti_raw,
+                stim_raw_paths,
+                iti_raw_path,
+                event_log_path,
+                gpio=gpio if USE_GPIO else None,
+            )
 
             screen.display_greyscale(SCREEN_BACKGROUND_GRAY)
             time.sleep(FINAL_GRAY_SEC)
