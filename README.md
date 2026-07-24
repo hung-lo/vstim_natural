@@ -24,8 +24,8 @@ What the runtime does:
 - prints a terminal progress line with percent and ETA during playback
 - optionally bakes a photodiode patch into the frames
 - logs display-request timestamps for `stim_on` and `iti_on` while the photodiode remains the ground truth for physical onset
-- with the camera wrapper, starts/stops the remote camera and fetches files back to box 151
-- logs planned sequence, request timestamps, and metadata
+- with the camera wrapper, starts/stops the remote camera, asks for a pre-stimulus camera baseline, and fetches files back to box 151
+- logs planned sequence, request timestamps, baseline metadata, and session metadata
 
 ## Default timing
 
@@ -100,6 +100,10 @@ If you want camera recording plus automatic file transfer and conversion, use:
 ```bash
 python3 run_stringer_vstim_cam.py
 ```
+
+That wrapper now asks for a pre-stimulus camera baseline in minutes, then lets
+you type `y` and press Enter to start early while the camera is already
+recording.
 
 Keep `run_stringer_vstim.py` around as the plain no-camera runner and as the
 baseline path if you want to debug the display flow independently.

@@ -8,11 +8,13 @@ remote camera start/stop control for the second Pi.
 """
 
 import json
+import math
+import select
 import shlex
 import subprocess
 import sys
-import time
 import threading
+import time
 from pathlib import Path
 
 import run_stringer_vstim as base
@@ -20,6 +22,9 @@ import run_stringer_vstim as base
 PROJECT_ROOT = base.PROJECT_ROOT
 OUTPUT_ROOT = base.OUTPUT_ROOT
 CAMERA_CONTROL_SCRIPT = PROJECT_ROOT / "remote_camera_control.py"
+DEFAULT_PRESTIM_BASELINE_MINUTES = 3.0
+BASELINE_INPUT_POLL_SEC = 0.25
+BASELINE_STATUS_INTERVAL_SEC = 10.0
 
 
 def _log_completed_process(proc, label):
@@ -59,7 +64,7 @@ def run_camera_control(args, background=False):
 
 def start_camera_recording(mouse_id, session_id):
     print("Starting remote camera recording...")
-    return run_camera_control(["start", "--mouse-id", mouse_id, "--session-id", session_id], background=True)
+    return run_camera_control(["start", "--mouse-id", mouse_id, "--session-id", session_id], background=False)
 
 
 def stop_camera_recording():
@@ -70,6 +75,131 @@ def stop_camera_recording():
 def fetch_camera_recording():
     print("Fetching camera files to box 151...")
     run_camera_control(["fetch"])
+
+
+
+
+def prompt_float_or_default(prompt, default_value, minimum=0.0):
+    raw = base.prompt_text("%s [%g]: " % (prompt, default_value)).strip()
+    if not raw:
+        return default_value
+    value = float(raw)
+    if not math.isfinite(value):
+        raise ValueError("%s must be a finite number" % prompt)
+    if value < minimum:
+        raise ValueError("%s must be at least %g" % (prompt, minimum))
+    return value
+
+
+def is_early_start_command(line):
+    return line.strip().lower() in {"y", "yes"}
+
+
+def watch_for_early_start(force_start_event, stop_event):
+    try:
+        stdin = sys.stdin
+        if not hasattr(stdin, "isatty") or not stdin.isatty():
+            return
+    except Exception:
+        return
+
+    while not stop_event.is_set() and not force_start_event.is_set():
+        try:
+            readable, _, _ = select.select([sys.stdin], [], [], BASELINE_INPUT_POLL_SEC)
+        except (OSError, ValueError, AttributeError):
+            return
+
+        if stop_event.is_set() or force_start_event.is_set():
+            return
+        if not readable:
+            continue
+
+        try:
+            line = sys.stdin.readline()
+        except Exception:
+            return
+
+        if line == "":
+            return
+
+        if is_early_start_command(line):
+            print(
+                "Early start requested. Stimuli will begin as soon as raw preparation and the initial gray period are complete."
+            )
+            force_start_event.set()
+            return
+
+        stripped = line.strip()
+        if stripped:
+            print(
+                "Ignoring input %r; baseline continues. Type y and Enter to request early stimulus start." % stripped
+            )
+
+
+def start_prestimulus_early_start_monitor():
+    force_start_event = threading.Event()
+    stop_event = threading.Event()
+    thread = None
+    interactive = hasattr(sys.stdin, "isatty") and sys.stdin.isatty()
+    if interactive:
+        thread = threading.Thread(target=watch_for_early_start, args=(force_start_event, stop_event), daemon=True)
+        thread.start()
+    else:
+        print("Interactive early-start override is unavailable because stdin is not a TTY.")
+    return force_start_event, stop_event, thread, interactive
+
+
+def stop_prestimulus_early_start_monitor(stop_event, thread):
+    if stop_event is not None:
+        stop_event.set()
+    if thread is not None:
+        thread.join(timeout=1.0)
+
+
+def wait_for_prestimulus_gate(baseline_start_monotonic, requested_baseline_sec, force_start_event):
+    initial_remaining_sec = max(0.0, requested_baseline_sec - (time.monotonic() - baseline_start_monotonic))
+    result = {
+        "requested_sec": requested_baseline_sec,
+        "remaining_sec_at_gate_entry": initial_remaining_sec,
+        "forced": False,
+        "end_reason": "",
+    }
+
+    if force_start_event.is_set():
+        result["forced"] = True
+        result["end_reason"] = "user_override"
+    elif initial_remaining_sec <= 0.0:
+        result["end_reason"] = "timer_satisfied_during_preparation"
+    else:
+        remaining_sec = initial_remaining_sec
+        while remaining_sec > 0.0 and not force_start_event.is_set():
+            wait_sec = min(BASELINE_STATUS_INTERVAL_SEC, remaining_sec)
+            if force_start_event.wait(timeout=wait_sec):
+                result["forced"] = True
+                result["end_reason"] = "user_override"
+                break
+            remaining_sec = max(0.0, requested_baseline_sec - (time.monotonic() - baseline_start_monotonic))
+            if remaining_sec > 0.0:
+                print("Pre-stimulus baseline remaining: %s ..." % base.format_seconds(remaining_sec))
+        else:
+            if result["end_reason"] != "user_override":
+                result["end_reason"] = "timer_elapsed"
+
+    result["elapsed_sec"] = time.monotonic() - baseline_start_monotonic
+    if not result["end_reason"]:
+        result["end_reason"] = "timer_elapsed"
+    return result
+
+
+def prestimulus_result_message(baseline_result):
+    reason = baseline_result["end_reason"]
+    if reason == "user_override":
+        return "Pre-stimulus baseline ended early by user request. Starting visual stimulus playback..."
+    if reason == "timer_satisfied_during_preparation":
+        return "Requested pre-stimulus baseline was satisfied during preparation. Starting visual stimulus playback..."
+    return "Pre-stimulus baseline complete. Starting visual stimulus playback..."
+
+
 
 
 def main():
@@ -86,6 +216,12 @@ def main():
     session_notes = base.prompt_text("Session notes, optional: ").strip()
     n_images_to_use = base.prompt_int_or_default("Number of unique images to use", base.N_IMAGES_TO_USE)
     n_repeats = base.prompt_int_or_default("Repeats per image", base.N_REPEATS)
+    prestim_baseline_minutes = prompt_float_or_default(
+        "Pre-stimulus camera baseline in minutes",
+        DEFAULT_PRESTIM_BASELINE_MINUTES,
+        minimum=0.0,
+    )
+    prestim_baseline_sec = prestim_baseline_minutes * 60.0
 
     image_dir = base.resolve_image_dir()
     all_pngs = base.list_png_files(image_dir)
@@ -99,6 +235,10 @@ def main():
     print("  Session notes, optional: %s" % session_notes)
     print("  Number of unique images: %d" % len(selected_pngs))
     print("  Repeats per image: %d" % n_repeats)
+    print("  Pre-stimulus camera baseline: %s" % base.format_seconds(prestim_baseline_sec))
+    print("  Camera timing: recording starts before RPG raw-file preparation")
+    print("  Early start: type y and press Enter after recording begins")
+    print("  Post-stimulus camera: no fixed end time; existing stop prompt is retained")
     print("  Total trials: %d" % len(trials))
     print("  Estimated playback time: %s" % base.format_seconds(estimated_playback_sec))
     print("  Output folder root: %s" % OUTPUT_ROOT)
@@ -191,6 +331,11 @@ def main():
         "photodiode_margin_px": base.PHOTODIODE_MARGIN_PX,
         "use_gpio": base.USE_GPIO,
         "ttl_pin_bcm": base.TTL_PIN_BCM,
+        "prestim_baseline_requested_minutes": prestim_baseline_minutes,
+        "prestim_baseline_requested_sec": prestim_baseline_sec,
+        "prestim_early_start_enabled": True,
+        "prestim_early_start_key": "y",
+        "poststim_baseline_mode": "free_end_existing_prompt",
         "selected_images": selected_rows,
         "trials": trials,
         "camera_enabled": True,
@@ -200,20 +345,69 @@ def main():
     metadata_path.write_text(json.dumps(metadata, indent=2, sort_keys=True) + chr(10))
 
     camera_started = False
+    camera_stopped = False
     session_completed = False
+    playback_started = False
+    camera_start_returned_utc = ""
+    prestim_baseline_start_utc = ""
+    prestim_baseline_start_monotonic = None
+    baseline_result = None
+    raw_cache_build_duration_sec = None
+    force_start_event = None
+    force_input_stop_event = None
+    force_input_thread = None
+    monitor_active = False
+    gpio = None
 
     try:
         start_camera_recording(mouse_id, session_id)
         camera_started = True
-        time.sleep(1.0)
+        camera_start_returned_utc = base.utc_iso_now()
+        prestim_baseline_start_utc = camera_start_returned_utc
+        prestim_baseline_start_monotonic = time.monotonic()
+        base.append_csv_row(
+            event_log_path,
+            {
+                "event_type": "prestim_baseline_start",
+                "notes": "requested_sec=%.3f; camera_start_command_returned" % prestim_baseline_sec,
+            },
+            base.EVENT_FIELDS,
+        )
+
+        force_start_event, force_input_stop_event, force_input_thread, monitor_active = start_prestimulus_early_start_monitor()
+        print()
+        print("Remote camera recording is active.")
+        print("Pre-stimulus baseline target: %s." % base.format_seconds(prestim_baseline_sec))
+        print("RPG raw files will be prepared while the camera records.")
+        print("Type y and press Enter at any time to request early stimulus start.")
+        print("The stimulus cannot begin until raw preparation and the initial gray period are complete.")
+        sys.stdout.flush()
 
         print("Preparing session raw files...")
+        raw_cache_build_start = time.perf_counter()
         stim_raw_paths, iti_raw_path = base.build_session_raw_cache(rpg, raw_cache_root, selected_pngs)
-        print("Session raw files ready. Starting visual stimulus playback...")
+        raw_cache_build_duration_sec = time.perf_counter() - raw_cache_build_start
+        baseline_elapsed_after_raw = time.monotonic() - prestim_baseline_start_monotonic
+        baseline_remaining_after_raw = max(0.0, prestim_baseline_sec - baseline_elapsed_after_raw)
+        base.append_csv_row(
+            event_log_path,
+            {
+                "event_type": "raw_cache_ready",
+                "notes": "build_duration_sec=%.6f; baseline_elapsed_sec=%.6f" % (
+                    raw_cache_build_duration_sec,
+                    baseline_elapsed_after_raw,
+                ),
+            },
+            base.EVENT_FIELDS,
+        )
+        print("Session raw files are ready.")
+        print(
+            "Camera baseline elapsed: %s; remaining: %s."
+            % (base.format_seconds(baseline_elapsed_after_raw), base.format_seconds(baseline_remaining_after_raw))
+        )
+        print("Type y and press Enter to start early.")
         sys.stdout.flush()
-        loaded_stim_raws = {}
 
-        gpio = None
         if base.USE_GPIO:
             gpio = base.setup_gpio()
 
@@ -222,22 +416,47 @@ def main():
                 screen.display_greyscale(base.SCREEN_BACKGROUND_GRAY)
                 time.sleep(base.INITIAL_GRAY_SEC)
 
+                loaded_stim_raws = {}
                 for image_path in selected_pngs:
                     loaded_stim_raws[image_path.stem] = screen.load_raw(str(stim_raw_paths[image_path.stem]))
                 iti_raw = screen.load_raw(str(iti_raw_path))
 
+                baseline_result = wait_for_prestimulus_gate(
+                    prestim_baseline_start_monotonic,
+                    prestim_baseline_sec,
+                    force_start_event,
+                )
+                stop_prestimulus_early_start_monitor(force_input_stop_event, force_input_thread)
+                force_input_thread = None
+                force_input_stop_event = None
+
                 base.append_csv_row(
                     event_log_path,
                     {
-                        "utc_iso": base.utc_iso_now(),
+                        "event_type": "prestim_baseline_end",
+                        "notes": "reason=%s; requested_sec=%.3f; actual_sec=%.3f; forced=%s"
+                        % (
+                            baseline_result["end_reason"],
+                            baseline_result["requested_sec"],
+                            baseline_result["elapsed_sec"],
+                            baseline_result["forced"],
+                        ),
+                    },
+                    base.EVENT_FIELDS,
+                )
+                base.append_csv_row(
+                    event_log_path,
+                    {
                         "event_type": "session_start",
                         "notes": "screen_opened",
                     },
                     base.EVENT_FIELDS,
                 )
+                print(prestimulus_result_message(baseline_result))
                 print("Stimulus playback is now active.")
                 sys.stdout.flush()
 
+                playback_started = True
                 base.run_trial_sequence(
                     screen,
                     trials,
@@ -256,7 +475,6 @@ def main():
                 base.append_csv_row(
                     event_log_path,
                     {
-                        "utc_iso": base.utc_iso_now(),
                         "event_type": "session_end",
                         "notes": "completed",
                     },
@@ -265,15 +483,27 @@ def main():
                 session_completed = True
 
         except KeyboardInterrupt:
-            base.append_csv_row(
-                event_log_path,
-                {
-                    "utc_iso": base.utc_iso_now(),
-                    "event_type": "session_end",
-                    "notes": "keyboard_interrupt",
-                },
-                base.EVENT_FIELDS,
-            )
+            stop_prestimulus_early_start_monitor(force_input_stop_event, force_input_thread)
+            force_input_thread = None
+            force_input_stop_event = None
+            if not playback_started:
+                base.append_csv_row(
+                    event_log_path,
+                    {
+                        "event_type": "session_end",
+                        "notes": "keyboard_interrupt_during_prestim",
+                    },
+                    base.EVENT_FIELDS,
+                )
+            else:
+                base.append_csv_row(
+                    event_log_path,
+                    {
+                        "event_type": "session_end",
+                        "notes": "keyboard_interrupt",
+                    },
+                    base.EVENT_FIELDS,
+                )
             raise
         finally:
             if base.USE_GPIO and gpio is not None:
@@ -288,6 +518,7 @@ def main():
         return 0
 
     finally:
+        stop_prestimulus_early_start_monitor(force_input_stop_event, force_input_thread)
         camera_stopped = False
         if camera_started:
             if base.prompt_yes_no("Stop camera recording now", default_yes=False):
@@ -312,6 +543,18 @@ def main():
         metadata["camera_started"] = camera_started
         metadata["camera_stopped"] = camera_stopped
         metadata["camera_session_id"] = session_id if camera_started else ""
+        metadata["session_completed"] = session_completed
+        metadata["playback_started"] = playback_started
+        metadata["camera_start_returned_utc"] = camera_start_returned_utc
+        metadata["prestim_baseline_start_utc"] = prestim_baseline_start_utc
+        metadata["prestim_baseline_actual_sec"] = baseline_result["elapsed_sec"] if baseline_result else ""
+        metadata["prestim_baseline_forced"] = baseline_result["forced"] if baseline_result else False
+        metadata["prestim_baseline_end_reason"] = baseline_result["end_reason"] if baseline_result else ""
+        metadata["prestim_baseline_remaining_sec_at_gate_entry"] = (
+            baseline_result["remaining_sec_at_gate_entry"] if baseline_result else ""
+        )
+        metadata["raw_cache_build_duration_sec"] = raw_cache_build_duration_sec if raw_cache_build_duration_sec is not None else ""
+        metadata["prestim_gate_released_utc"] = base.utc_iso_now() if baseline_result else ""
         metadata_path.write_text(json.dumps(metadata, indent=2, sort_keys=True) + chr(10))
         if session_completed:
             print("Session finished. Files are in: %s" % session_root)
