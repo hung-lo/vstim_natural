@@ -370,9 +370,8 @@ def run_trial_sequence(screen, trials, loaded_stim_raws, iti_raw, stim_raw_paths
         print_progress(trial_index, len(trials), playback_start)
 
 
-def build_session_raw_cache(rpg_module, session_raw_dir, selected_image_files):
+def build_stim_raw_cache(rpg_module, session_raw_dir, selected_image_files):
     stim_dir = ensure_dir(session_raw_dir / "stim_on")
-    iti_dir = ensure_dir(session_raw_dir / "iti")
 
     stim_raw_paths = {}
     for image_path in selected_image_files:
@@ -381,11 +380,22 @@ def build_session_raw_cache(rpg_module, session_raw_dir, selected_image_files):
         convert_canvas_to_rpg_raw(rpg_module, stim_canvas, raw_path, STIM_DURATION_SEC)
         stim_raw_paths[image_path.stem] = raw_path
 
+    return stim_raw_paths
+
+
+def build_iti_raw_cache(rpg_module, session_raw_dir):
+    iti_dir = ensure_dir(session_raw_dir / "iti")
+
     iti_canvas = build_canvas(None, SCREEN_RESOLUTION, photodiode_on=False)
     iti_raw_path = iti_dir / "gray_iti.raw"
     convert_canvas_to_rpg_raw(rpg_module, iti_canvas, iti_raw_path, ITI_DURATION_SEC)
-    return stim_raw_paths, iti_raw_path
+    return iti_raw_path
 
+
+def build_session_raw_cache(rpg_module, session_raw_dir, selected_image_files):
+    stim_raw_paths = build_stim_raw_cache(rpg_module, session_raw_dir, selected_image_files)
+    iti_raw_path = build_iti_raw_cache(rpg_module, session_raw_dir)
+    return stim_raw_paths, iti_raw_path
 
 def setup_gpio():
     if not USE_GPIO:

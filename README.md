@@ -24,7 +24,7 @@ What the runtime does:
 - prints a terminal progress line with percent and ETA during playback
 - optionally bakes a photodiode patch into the frames
 - logs display-request timestamps for `stim_on` and `iti_on` while the photodiode remains the ground truth for physical onset
-- with the camera wrapper, starts/stops the remote camera, asks for a pre-stimulus camera baseline, and fetches files back to box 151
+- with the camera wrapper, puts the monitor on the ITI-style gray frame before camera start, records a pre-stimulus baseline while stimulus raws are prepared, and fetches files back to box 151
 - logs planned sequence, request timestamps, baseline metadata, and session metadata
 
 ## Default timing
