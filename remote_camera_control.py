@@ -25,6 +25,7 @@ You can still override the host manually with:
 import argparse
 import csv
 import json
+import re
 import shutil
 import shlex
 import subprocess
@@ -44,6 +45,22 @@ REMOTE_CAMERA_PREVIEW_PID_FILE = "/tmp/remote_camera_preview.pid"
 
 REMOTE_VIDEO_ROOT = "/home/pi/stim_logs"
 LOCAL_VIDEO_ROOT = Path("/mnt/hd")
+
+SSH_OPTIONS = [
+    "-n",
+    "-T",
+    "-o", "BatchMode=yes",
+    "-o", "ConnectTimeout=5",
+    "-o", "ServerAliveInterval=2",
+    "-o", "ServerAliveCountMax=3",
+]
+CAMERA_START_LAUNCH_TIMEOUT_SEC = 10.0
+CAMERA_START_READY_TIMEOUT_SEC = 8.0
+CAMERA_READY_POLL_SEC = 0.25
+CAMERA_LOG_TAIL_LINES = 50
+CAMERA_STOP_TIMEOUT_SEC = 10.0
+CAMERA_PREVIEW_LAUNCH_TIMEOUT_SEC = 10.0
+CAMERA_PREVIEW_STOP_TIMEOUT_SEC = 5.0
 SESSION_NAME_SUFFIX = "vstim_natural"
 
 CAMERA_FRAMERATE = 30
@@ -76,12 +93,19 @@ def sanitize_id(text):
     return "".join(keep)
 
 
-def run_cmd(cmd, check=True, dry_run=False):
+def run_cmd(cmd, check=True, dry_run=False, timeout=None):
     print("+ " + " ".join(shlex.quote(x) for x in cmd))
     if dry_run:
-        return subprocess.CompletedProcess(cmd, 0)
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
     try:
-        return subprocess.run(cmd, check=check, text=True, capture_output=True)
+        return subprocess.run(cmd, check=check, text=True, capture_output=True, timeout=timeout)
+    except subprocess.TimeoutExpired as exc:
+        if exc.stdout:
+            print(exc.stdout, end="")
+        if exc.stderr:
+            print(exc.stderr, end="", file=sys.stderr)
+        timeout_desc = "unknown" if timeout is None else "%.1f" % timeout
+        raise RuntimeError("Command timed out after %s seconds: %s" % (timeout_desc, " ".join(shlex.quote(x) for x in cmd))) from exc
     except subprocess.CalledProcessError as exc:
         if exc.stdout:
             print(exc.stdout, end="")
@@ -90,8 +114,110 @@ def run_cmd(cmd, check=True, dry_run=False):
         raise
 
 
-def run_ssh(camera_host, remote_cmd, check=True, dry_run=False):
-    return run_cmd(["ssh", camera_host, remote_cmd], check=check, dry_run=dry_run)
+def run_ssh(camera_host, remote_cmd, check=True, dry_run=False, timeout=None):
+    return run_cmd(["ssh", *SSH_OPTIONS, camera_host, remote_cmd], check=check, dry_run=dry_run, timeout=timeout)
+
+
+def build_remote_camera_launch_command(paths, framerate, remote_camera_repo, remote_camera_start, remote_log, pid_file):
+    return (
+        "set -e; "
+        f"mkdir -p {shlex.quote(paths['remote_video_dir'])}; "
+        f"cd {shlex.quote(remote_camera_repo)}; "
+        f"nohup python3 {shlex.quote(remote_camera_start)} {shlex.quote(paths['remote_base_path'])} {int(framerate)} </dev/null >> {shlex.quote(remote_log)} 2>&1 & "
+        "pid=$!; "
+        f"echo \"$pid\" > {shlex.quote(pid_file)}; "
+        "printf 'CAMERA_PID=%s\\n' \"$pid\""
+    )
+
+
+def build_remote_pid_check_command(pid_file):
+    return (
+        f"pid=$(cat {shlex.quote(pid_file)} 2>/dev/null || true); "
+        "if [ -n \"$pid\" ] && kill -0 \"$pid\" 2>/dev/null; then "
+        "echo \"RUNNING:$pid\"; "
+        "exit 0; "
+        "fi; "
+        "echo NOT_RUNNING; "
+        "exit 1"
+    )
+
+
+def build_remote_log_tail_command(log_file, n_lines=CAMERA_LOG_TAIL_LINES):
+    return "tail -n %d %s 2>/dev/null || true" % (int(n_lines), shlex.quote(log_file))
+
+
+def build_remote_camera_stop_command(pid_file, remote_stop_script):
+    return (
+        "set -e; "
+        f"pid=$(cat {shlex.quote(pid_file)} 2>/dev/null || true); "
+        "if [ -n \"$pid\" ] && [ -r /proc/$pid/cmdline ]; then "
+        "cmdline=$(tr '\\0' ' ' < /proc/$pid/cmdline); "
+        "case \"$cmdline\" in "
+        "*start_acquisition.py*) "
+        "kill \"$pid\" 2>/dev/null || true; "
+        "sleep 1; "
+        "kill -9 \"$pid\" 2>/dev/null || true; "
+        ";; "
+        "*) echo 'PID file does not match expected acquisition process; falling back to stop script' >&2; ;; "
+        "esac; "
+        f"rm -f {shlex.quote(pid_file)}; "
+        "fi; "
+        f"bash {shlex.quote(remote_stop_script)}"
+    )
+
+
+def parse_camera_pid(stdout):
+    match = re.search(r"CAMERA_PID=(\d+)", stdout or "")
+    if match:
+        return int(match.group(1))
+    match = re.search(r"RUNNING:(\d+)", stdout or "")
+    if match:
+        return int(match.group(1))
+    return None
+
+
+def tail_remote_log(camera_host, log_file, dry_run=False):
+    result = run_ssh(
+        camera_host,
+        build_remote_log_tail_command(log_file),
+        check=False,
+        dry_run=dry_run,
+        timeout=CAMERA_START_READY_TIMEOUT_SEC,
+    )
+    stdout = result.stdout or ""
+    stderr = result.stderr or ""
+    return (stdout + stderr).strip()
+
+
+def wait_for_remote_camera_ready(camera_host, pid_file, log_file, dry_run=False, timeout_sec=CAMERA_START_READY_TIMEOUT_SEC):
+    if dry_run:
+        return {"camera_pid": None, "stdout": "[dry-run]", "returncode": 0}
+
+    deadline = time.monotonic() + float(timeout_sec)
+    last_output = ""
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        poll_timeout = min(CAMERA_READY_POLL_SEC, max(0.2, remaining))
+        result = run_ssh(
+            camera_host,
+            build_remote_pid_check_command(pid_file),
+            check=False,
+            dry_run=dry_run,
+            timeout=poll_timeout + 2.0,
+        )
+        last_output = (result.stdout or "") + (result.stderr or "")
+        if result.returncode == 0:
+            pid = parse_camera_pid(last_output)
+            return {"camera_pid": pid, "stdout": last_output, "returncode": result.returncode}
+        time.sleep(min(CAMERA_READY_POLL_SEC, max(0.0, remaining)))
+
+    tail = tail_remote_log(camera_host, log_file, dry_run=dry_run)
+    raise RuntimeError(
+        "Camera did not report ready within %.1f seconds. Last remote log tail:\n%s"
+        % (timeout_sec, tail or last_output or "<no output>")
+    )
 
 
 def run_rsync(camera_host, remote_dir, local_dir, dry_run=False):
@@ -245,6 +371,8 @@ def make_session_paths(args):
     remote_session_dir = "%s/%s" % (REMOTE_VIDEO_ROOT, session_id)
     remote_video_dir = "%s/video" % remote_session_dir
     remote_base_path = "%s/%s" % (remote_video_dir, session_id)
+    remote_log_file = "%s/camera_acquisition.log" % remote_video_dir
+    remote_pid_file = "%s/camera_acquisition.pid" % remote_video_dir
 
     return {
         "mouse_id": mouse_id,
@@ -254,6 +382,8 @@ def make_session_paths(args):
         "remote_session_dir": remote_session_dir,
         "remote_video_dir": remote_video_dir,
         "remote_base_path": remote_base_path,
+        "remote_log_file": remote_log_file,
+        "remote_pid_file": remote_pid_file,
     }
 
 
@@ -270,35 +400,128 @@ def start_camera(args):
         "remote_camera_repo": args.remote_camera_repo,
         "remote_camera_start": args.remote_camera_start,
         "remote_camera_stop": args.remote_camera_stop,
+        "camera_status": "launch_requested",
+        "camera_pid": None,
+        "camera_start_requested_utc": utc_iso_now(),
+        "camera_launch_returned_utc": None,
+        "camera_start_confirmed_utc": None,
         **paths,
     }
 
     append_event(local_video_dir, "camera_start_requested", state)
-
-    remote_log = "%s/camera_acquisition.log" % paths["remote_video_dir"]
-    safe_start_pattern = "[v]ideo_acquisition/start_acquisition.py"
-    cleanup_cmd = "pkill -f %s || true" % shlex.quote(safe_start_pattern)
-    launch_cmd = (
-        "mkdir -p %s && "
-        "cd %s && "
-        "nohup python3 %s %s %d >> %s 2>&1 &"
-        % (
-            shlex.quote(paths["remote_video_dir"]),
-            shlex.quote(args.remote_camera_repo),
-            shlex.quote(args.remote_camera_start),
-            shlex.quote(paths["remote_base_path"]),
-            int(args.framerate),
-            shlex.quote(remote_log),
-        )
-    )
-
-    run_ssh(camera_host, cleanup_cmd, dry_run=args.dry_run)
-    run_ssh(camera_host, launch_cmd, dry_run=args.dry_run)
-
-    append_event(local_video_dir, "camera_start_returned", state)
     save_state(state)
 
-    print("Camera start command sent.")
+    remote_log = paths["remote_log_file"]
+    remote_pid_file = paths["remote_pid_file"]
+    launch_cmd = build_remote_camera_launch_command(
+        paths,
+        args.framerate,
+        args.remote_camera_repo,
+        args.remote_camera_start,
+        remote_log,
+        remote_pid_file,
+    )
+
+    launch_timed_out = False
+    launch_stdout = ""
+    try:
+        launch_result = run_ssh(
+            camera_host,
+            launch_cmd,
+            dry_run=args.dry_run,
+            timeout=CAMERA_START_LAUNCH_TIMEOUT_SEC,
+        )
+        launch_stdout = launch_result.stdout or ""
+        state["camera_status"] = "launch_returned"
+        state["camera_launch_returned_utc"] = utc_iso_now()
+        state["camera_pid"] = parse_camera_pid(launch_stdout) or state.get("camera_pid")
+        save_state(state)
+        append_event(
+            local_video_dir,
+            "camera_start_returned",
+            {
+                **state,
+                "launch_stdout": launch_stdout,
+            },
+        )
+    except RuntimeError as exc:
+        if "timed out" in str(exc).lower():
+            launch_timed_out = True
+            state["camera_launch_timed_out"] = True
+            print("Camera launch SSH timed out; checking whether the remote process still started.")
+            save_state(state)
+        else:
+            state["camera_status"] = "start_failed"
+            state["camera_start_failed_utc"] = utc_iso_now()
+            state["camera_start_error"] = str(exc)
+            save_state(state)
+            append_event(
+                local_video_dir,
+                "camera_start_failed",
+                {
+                    "camera_host": camera_host,
+                    "error": str(exc),
+                },
+            )
+            raise
+
+    try:
+        ready = wait_for_remote_camera_ready(
+            camera_host,
+            remote_pid_file,
+            remote_log,
+            dry_run=args.dry_run,
+            timeout_sec=CAMERA_START_READY_TIMEOUT_SEC,
+        )
+        camera_pid = ready.get("camera_pid")
+        if camera_pid is not None:
+            state["camera_pid"] = camera_pid
+        state["camera_status"] = "recording_confirmed"
+        state["camera_start_confirmed_utc"] = utc_iso_now()
+        state["camera_launch_timed_out"] = launch_timed_out
+        save_state(state)
+        append_event(
+            local_video_dir,
+            "camera_recording_confirmed",
+            {
+                "camera_host": camera_host,
+                "camera_pid": state.get("camera_pid"),
+                "camera_launch_timed_out": launch_timed_out,
+                "remote_pid_file": remote_pid_file,
+                "remote_log_file": remote_log,
+            },
+        )
+    except Exception as exc:
+        tail = tail_remote_log(camera_host, remote_log, dry_run=args.dry_run)
+        print("Camera startup failed. Remote log tail\n%s" % (tail or "<no log output>"), file=sys.stderr)
+        state["camera_status"] = "start_failed"
+        state["camera_start_failed_utc"] = utc_iso_now()
+        state["camera_start_error"] = str(exc)
+        save_state(state)
+        append_event(
+            local_video_dir,
+            "camera_start_failed",
+            {
+                "camera_host": camera_host,
+                "error": str(exc),
+                "remote_log_tail": tail,
+            },
+        )
+        try:
+            stop_cmd = build_remote_camera_stop_command(remote_pid_file, args.remote_camera_stop)
+            run_ssh(
+                camera_host,
+                stop_cmd,
+                check=False,
+                dry_run=args.dry_run,
+                timeout=CAMERA_STOP_TIMEOUT_SEC,
+            )
+        except Exception:
+            pass
+        raise RuntimeError("Camera recording did not become ready.") from exc
+
+    append_event(local_video_dir, "camera_start_returned", state)
+    print("Camera recording confirmed.")
     print("Camera host:      %s" % camera_host)
     print("Remote video dir: %s" % paths["remote_video_dir"])
     print("Local video dir:  %s" % local_video_dir)
@@ -315,13 +538,27 @@ def stop_camera(args, state=None):
     camera_host = resolve_camera_host(args, state)
     local_video_dir = Path(state.get("local_video_dir", LOCAL_VIDEO_ROOT / "unknown" / "video"))
     local_video_dir.mkdir(parents=True, exist_ok=True)
+    remote_pid_file = state.get("remote_pid_file") or "%s/camera_acquisition.pid" % state.get("remote_video_dir", REMOTE_VIDEO_ROOT)
 
-    append_event(local_video_dir, "camera_stop_requested", {"camera_host": camera_host})
+    append_event(local_video_dir, "camera_stop_requested", {"camera_host": camera_host, "remote_pid_file": remote_pid_file})
+    state["camera_status"] = "stop_requested"
+    state["camera_stop_requested_utc"] = utc_iso_now()
+    save_state(state)
 
     remote_stop = getattr(args, "remote_camera_stop", None) or state.get("remote_camera_stop") or REMOTE_CAMERA_STOP
-    run_ssh(camera_host, "bash %s" % shlex.quote(remote_stop), check=not args.ignore_stop_errors, dry_run=args.dry_run)
+    stop_cmd = build_remote_camera_stop_command(remote_pid_file, remote_stop)
+    run_ssh(
+        camera_host,
+        stop_cmd,
+        check=not args.ignore_stop_errors,
+        dry_run=args.dry_run,
+        timeout=CAMERA_STOP_TIMEOUT_SEC,
+    )
 
-    append_event(local_video_dir, "camera_stop_returned", {"camera_host": camera_host})
+    state["camera_status"] = "stopped"
+    state["camera_stop_returned_utc"] = utc_iso_now()
+    save_state(state)
+    append_event(local_video_dir, "camera_stop_returned", {"camera_host": camera_host, "remote_pid_file": remote_pid_file})
     print("Camera stop command sent.")
     return state
 
@@ -333,7 +570,7 @@ def preview_camera(args):
         "cam=$(command -v rpicam-hello || command -v libcamera-hello); "
         "if [ -z \"$cam\" ]; then echo 'No rpicam-hello or libcamera-hello found' >&2; exit 1; fi; "
         "mkdir -p /home/pi/stim_logs; "
-        "nohup \"$cam\" -t 0 --fullscreen >%s 2>&1 & echo $! > %s"
+        "nohup \"$cam\" -t 0 --fullscreen </dev/null >%s 2>&1 & echo $! > %s"
         % (shlex.quote(REMOTE_CAMERA_PREVIEW_LOG), shlex.quote(REMOTE_CAMERA_PREVIEW_PID_FILE))
     )
     stop_cmd = (
@@ -352,7 +589,7 @@ def preview_camera(args):
     )
 
     print("Starting remote camera preview on %s..." % camera_host)
-    run_ssh(camera_host, preview_cmd, dry_run=args.dry_run)
+    run_ssh(camera_host, preview_cmd, dry_run=args.dry_run, timeout=CAMERA_PREVIEW_LAUNCH_TIMEOUT_SEC)
     print("Preview started. Type y and Enter to stop it.")
     if not args.dry_run:
         while True:
@@ -363,10 +600,40 @@ def preview_camera(args):
             if response == "y":
                 break
             print("Preview still running. Type y and Enter to stop.")
-        run_ssh(camera_host, stop_cmd, dry_run=args.dry_run)
+        run_ssh(camera_host, stop_cmd, dry_run=args.dry_run, timeout=CAMERA_PREVIEW_STOP_TIMEOUT_SEC)
         print("Preview stopped.")
     else:
         print("Dry run finished; preview was not actually started.")
+
+
+def status_camera(args):
+    state = load_state() if STATE_FILE.exists() else None
+    camera_host = resolve_camera_host(args, state)
+    remote_pid_file = None
+    remote_log_file = None
+    if state:
+        remote_pid_file = state.get("remote_pid_file")
+        remote_log_file = state.get("remote_log_file")
+    if not remote_pid_file:
+        remote_pid_file = "%s/camera_acquisition.pid" % (state.get("remote_video_dir") if state else REMOTE_VIDEO_ROOT)
+    if not remote_log_file:
+        remote_log_file = "%s/camera_acquisition.log" % (state.get("remote_video_dir") if state else REMOTE_VIDEO_ROOT)
+    remote_cmd = (
+        "echo '--- saved camera state ---'; "
+        "if [ -f %s ]; then cat %s; else echo 'No pid file'; fi; "
+        "echo '--- camera acquisition processes ---'; "
+        "pid=$(cat %s 2>/dev/null || true); "
+        "if [ -n \"$pid\" ] && kill -0 \"$pid\" 2>/dev/null; then echo RUNNING:$pid; else echo NOT_RUNNING; fi; "
+        "echo '--- recent camera logs ---'; "
+        "tail -n 20 %s 2>/dev/null || true"
+        % (
+            shlex.quote(remote_pid_file),
+            shlex.quote(remote_pid_file),
+            shlex.quote(remote_pid_file),
+            shlex.quote(remote_log_file),
+        )
+    )
+    run_ssh(camera_host, remote_cmd, dry_run=args.dry_run, timeout=CAMERA_START_READY_TIMEOUT_SEC)
 
 
 def fetch_camera(args, state=None):

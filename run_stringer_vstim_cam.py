@@ -37,7 +37,7 @@ def _log_completed_process(proc, label):
         print("%s exited with code %s" % (label, proc.returncode), file=sys.stderr)
 
 
-def run_camera_control(args, background=False):
+def run_camera_control(args, background=False, timeout=None):
     cmd = [sys.executable, str(CAMERA_CONTROL_SCRIPT)] + list(args)
     print("+ " + " ".join(shlex.quote(x) for x in cmd))
     if background:
@@ -47,7 +47,7 @@ def run_camera_control(args, background=False):
         return proc
 
     try:
-        result = subprocess.run(cmd, check=True, text=True, capture_output=True)
+        result = subprocess.run(cmd, check=True, text=True, capture_output=True, timeout=timeout)
     except subprocess.CalledProcessError as exc:
         if exc.stdout:
             print(exc.stdout, end="")
@@ -64,7 +64,7 @@ def run_camera_control(args, background=False):
 
 def start_camera_recording(mouse_id, session_id):
     print("Starting remote camera recording...")
-    return run_camera_control(["start", "--mouse-id", mouse_id, "--session-id", session_id], background=False)
+    return run_camera_control(["start", "--mouse-id", mouse_id, "--session-id", session_id], background=False, timeout=20.0)
 
 
 def stop_camera_recording():
@@ -260,6 +260,153 @@ def prestimulus_result_message(baseline_result):
     return "Pre-stimulus baseline complete. Starting visual stimulus playback..."
 
 
+def run_poststim_black_baseline(screen, iti_raw, event_log_path):
+    final_gray_repeats = max(1, int(math.ceil(base.POSTSTIM_TRANSITION_GRAY_SEC / base.ITI_DURATION_SEC)))
+    for _ in range(final_gray_repeats):
+        screen.display_raw(iti_raw)
+
+    base.append_csv_row(
+        event_log_path,
+        {
+            "event_type": "stimulus_playback_end",
+            "notes": "last_trial_completed=true",
+        },
+        base.EVENT_FIELDS,
+    )
+    base.append_csv_row(
+        event_log_path,
+        {
+            "event_type": "poststim_gray_end",
+            "notes": "duration_sec=%.3f" % base.POSTSTIM_TRANSITION_GRAY_SEC,
+        },
+        base.EVENT_FIELDS,
+    )
+
+    poststim_black_start_monotonic = time.monotonic()
+    screen.display_greyscale(base.POSTSTIM_BLACK_LEVEL)
+    poststim_black_on_utc = base.utc_iso_now()
+    base.append_csv_row(
+        event_log_path,
+        {
+            "event_type": "poststim_black_on",
+            "notes": "black_level=%d; screen_open=true" % base.POSTSTIM_BLACK_LEVEL,
+        },
+        base.EVENT_FIELDS,
+    )
+
+    camera_stop_confirmed = False
+    camera_fetched = False
+    poststim_camera_stop_requested_utc = ""
+    poststim_camera_stop_confirmed_utc = ""
+    poststim_black_ended_after_fetch = False
+
+    try:
+        while True:
+            if not base.prompt_yes_no(
+                "Stop camera recording and end the black post-stimulus baseline now",
+                default_yes=False,
+            ):
+                print("Black post-stimulus baseline continues. Type y and Enter when ready to stop.")
+                continue
+
+            poststim_camera_stop_requested_utc = base.utc_iso_now()
+            base.append_csv_row(
+                event_log_path,
+                {
+                    "event_type": "camera_stop_requested",
+                    "notes": "poststim_black_active=true",
+                },
+                base.EVENT_FIELDS,
+            )
+
+            try:
+                stop_camera_recording()
+                camera_stop_confirmed = True
+                poststim_camera_stop_confirmed_utc = base.utc_iso_now()
+                base.append_csv_row(
+                    event_log_path,
+                    {
+                        "event_type": "camera_stop_confirmed",
+                        "notes": "poststim_black_active=true",
+                    },
+                    base.EVENT_FIELDS,
+                )
+            except Exception as exc:
+                print("ERROR stopping camera: %s" % exc, file=sys.stderr)
+                print("Black post-stimulus baseline continues. Type y and Enter when ready to retry.")
+                continue
+
+            try:
+                time.sleep(2.0)
+                fetch_camera_recording()
+                camera_fetched = True
+                poststim_black_ended_after_fetch = True
+            except Exception as exc:
+                print("ERROR fetching camera: %s" % exc, file=sys.stderr)
+                if base.prompt_yes_no("Retry fetch while keeping the screen black", default_yes=True):
+                    continue
+                print("Leaving black baseline without fetched files.")
+            break
+    except KeyboardInterrupt:
+        print("Keyboard interrupt during black baseline. Attempting to stop camera before leaving the screen.")
+        if not camera_stop_confirmed:
+            poststim_camera_stop_requested_utc = poststim_camera_stop_requested_utc or base.utc_iso_now()
+            base.append_csv_row(
+                event_log_path,
+                {
+                    "event_type": "camera_stop_requested",
+                    "notes": "keyboard_interrupt_during_poststim_black",
+                },
+                base.EVENT_FIELDS,
+            )
+            try:
+                stop_camera_recording()
+                camera_stop_confirmed = True
+                poststim_camera_stop_confirmed_utc = base.utc_iso_now()
+                base.append_csv_row(
+                    event_log_path,
+                    {
+                        "event_type": "camera_stop_confirmed",
+                        "notes": "keyboard_interrupt_during_poststim_black",
+                    },
+                    base.EVENT_FIELDS,
+                )
+            except Exception as exc:
+                print("ERROR stopping camera after KeyboardInterrupt: %s" % exc, file=sys.stderr)
+
+    poststim_black_actual_sec = time.monotonic() - poststim_black_start_monotonic
+    base.append_csv_row(
+        event_log_path,
+        {
+            "event_type": "poststim_black_end",
+            "notes": "actual_sec=%.6f; camera_stop_confirmed=%s; camera_fetched=%s"
+            % (poststim_black_actual_sec, camera_stop_confirmed, camera_fetched),
+        },
+        base.EVENT_FIELDS,
+    )
+    base.append_csv_row(
+        event_log_path,
+        {
+            "event_type": "session_end",
+            "notes": "completed=%s; camera_fetched=%s" % (camera_fetched, camera_fetched),
+        },
+        base.EVENT_FIELDS,
+    )
+
+    return {
+        "poststim_black_on_utc": poststim_black_on_utc,
+        "poststim_black_actual_sec": poststim_black_actual_sec,
+        "poststim_camera_stop_requested_utc": poststim_camera_stop_requested_utc,
+        "poststim_camera_stop_confirmed_utc": poststim_camera_stop_confirmed_utc,
+        "poststim_black_ended_after_fetch": poststim_black_ended_after_fetch,
+        "camera_stop_confirmed": camera_stop_confirmed,
+        "camera_fetched": camera_fetched,
+        "session_completed": camera_fetched,
+        "poststim_screen_remained_open": True,
+        "poststim_visual_condition": "black_grayscale_0",
+    }
+
+
 def main():
     base.print_environment()
     try:
@@ -394,12 +541,15 @@ def main():
         "prestim_baseline_requested_sec": prestim_baseline_sec,
         "prestim_early_start_enabled": True,
         "prestim_early_start_key": "y",
-        "poststim_baseline_mode": "free_end_existing_prompt",
+        "poststim_baseline_mode": "free_end_user_confirmed",
+        "poststim_transition_gray_sec": base.POSTSTIM_TRANSITION_GRAY_SEC,
+        "poststim_black_level": base.POSTSTIM_BLACK_LEVEL,
+        "poststim_screen_remained_open": True,
         "prestim_visual_condition": "gray_iti_photodiode_off",
         "prestim_screen_open_before_camera": True,
         "prestim_raw_build_under_gray": True,
         "prestim_minimum_gray_sec": base.INITIAL_GRAY_SEC,
-        "prestim_baseline_clock_reference": "camera_start_command_returned",
+        "prestim_baseline_clock_reference": "camera_recording_confirmed",
         "selected_images": selected_rows,
         "trials": trials,
         "camera_enabled": True,
@@ -416,13 +566,18 @@ def main():
     raw_cache_build_duration_sec = None
     raw_cache_built_with_screen_open = False
     raw_cache_screen_compatibility_fallback = False
+    camera_start_requested_utc = ""
     camera_start_returned_utc = ""
+    camera_start_confirmed_utc = ""
     prestim_gray_on_utc = ""
     prestim_gray_ready_utc = ""
     prestim_gray_start_monotonic = None
     prestim_baseline_start_utc = ""
     prestim_baseline_start_monotonic = None
     baseline_result = None
+    poststim_result = None
+    camera_stop_handled = False
+    camera_fetched = False
     force_start_event = None
     force_input_stop_event = None
     force_input_thread = None
@@ -464,16 +619,34 @@ def main():
                 print("Pre-stimulus gray screen is active.")
                 sys.stdout.flush()
 
+                camera_start_requested_utc = base.utc_iso_now()
+                base.append_csv_row(
+                    event_log_path,
+                    {
+                        "event_type": "camera_start_requested",
+                        "notes": "gray_already_active=true; prestim_baseline_requested_sec=%.3f" % prestim_baseline_sec,
+                    },
+                    base.EVENT_FIELDS,
+                )
                 start_camera_recording(mouse_id, session_id)
                 camera_started = True
                 camera_start_returned_utc = base.utc_iso_now()
-                prestim_baseline_start_utc = camera_start_returned_utc
+                camera_start_confirmed_utc = camera_start_returned_utc
+                prestim_baseline_start_utc = camera_start_confirmed_utc
                 prestim_baseline_start_monotonic = time.monotonic()
                 base.append_csv_row(
                     event_log_path,
                     {
+                        "event_type": "camera_recording_confirmed",
+                        "notes": "camera_pid_confirmed=true; gray_already_active=true",
+                    },
+                    base.EVENT_FIELDS,
+                )
+                base.append_csv_row(
+                    event_log_path,
+                    {
                         "event_type": "prestim_baseline_start",
-                        "notes": "requested_sec=%.3f; gray_already_active=true; camera_start_command_returned=true" % prestim_baseline_sec,
+                        "notes": "requested_sec=%.3f; gray_already_active=true; camera_recording_confirmed=true" % prestim_baseline_sec,
                     },
                     base.EVENT_FIELDS,
                 )
@@ -482,7 +655,7 @@ def main():
                 print()
                 print("Remote camera recording is active.")
                 print("Pre-stimulus baseline target: %s." % base.format_seconds(prestim_baseline_sec))
-                print("The requested baseline clock begins after the camera start command returns.")
+                print("The requested baseline clock begins after recording is confirmed.")
                 print("Stimulus raw files will be prepared while gray remains on the screen.")
                 print("Type y and press Enter to request early stimulus start.")
                 sys.stdout.flush()
@@ -572,20 +745,10 @@ def main():
                     gpio=gpio if base.USE_GPIO else None,
                 )
 
-                final_gray_repeats = max(1, int(math.ceil(base.FINAL_GRAY_SEC / base.ITI_DURATION_SEC)))
-                for _ in range(final_gray_repeats):
-                    screen.display_raw(iti_raw)
-                sys.stdout.write("\n")
-                sys.stdout.flush()
-                base.append_csv_row(
-                    event_log_path,
-                    {
-                        "event_type": "session_end",
-                        "notes": "completed",
-                    },
-                    base.EVENT_FIELDS,
-                )
-                session_completed = True
+                poststim_result = run_poststim_black_baseline(screen, iti_raw, event_log_path)
+                camera_stop_handled = True
+                camera_fetched = poststim_result["camera_fetched"]
+                session_completed = poststim_result["session_completed"]
 
         except KeyboardInterrupt:
             stop_prestimulus_early_start_monitor(force_input_stop_event, force_input_thread)
@@ -640,14 +803,16 @@ def main():
 
     finally:
         stop_prestimulus_early_start_monitor(force_input_stop_event, force_input_thread)
-        camera_stopped = False
-        if camera_started:
+        camera_stopped = poststim_result["camera_stop_confirmed"] if poststim_result else False
+        camera_fetched = poststim_result["camera_fetched"] if poststim_result else False
+        if camera_started and not camera_stop_handled:
             if base.prompt_yes_no("Stop camera recording now", default_yes=False):
                 try:
                     stop_camera_recording()
                     time.sleep(2.0)
                     fetch_camera_recording()
                     camera_stopped = True
+                    camera_fetched = True
                 except Exception as exc:
                     print("ERROR stopping camera: %s" % exc, file=sys.stderr)
             else:
@@ -663,17 +828,30 @@ def main():
         metadata["raw_cache_root"] = str(raw_cache_root)
         metadata["camera_started"] = camera_started
         metadata["camera_stopped"] = camera_stopped
+        metadata["camera_fetched"] = camera_fetched
         metadata["camera_session_id"] = session_id if camera_started else ""
+        metadata["camera_start_requested_utc"] = camera_start_requested_utc
+        metadata["camera_start_returned_utc"] = camera_start_returned_utc
+        metadata["camera_start_confirmed_utc"] = camera_start_confirmed_utc
         metadata["session_completed"] = session_completed
         metadata["playback_started"] = playback_started
+        metadata["poststim_baseline_mode"] = "free_end_user_confirmed"
+        metadata["poststim_transition_gray_sec"] = base.POSTSTIM_TRANSITION_GRAY_SEC
+        metadata["poststim_black_level"] = base.POSTSTIM_BLACK_LEVEL
+        metadata["poststim_visual_condition"] = poststim_result["poststim_visual_condition"] if poststim_result else ""
+        metadata["poststim_screen_remained_open"] = poststim_result["poststim_screen_remained_open"] if poststim_result else False
+        metadata["poststim_black_on_utc"] = poststim_result["poststim_black_on_utc"] if poststim_result else ""
+        metadata["poststim_camera_stop_requested_utc"] = poststim_result["poststim_camera_stop_requested_utc"] if poststim_result else ""
+        metadata["poststim_camera_stop_confirmed_utc"] = poststim_result["poststim_camera_stop_confirmed_utc"] if poststim_result else ""
+        metadata["poststim_black_actual_sec"] = poststim_result["poststim_black_actual_sec"] if poststim_result else ""
+        metadata["poststim_black_ended_after_fetch"] = poststim_result["poststim_black_ended_after_fetch"] if poststim_result else False
         metadata["prestim_visual_condition"] = "gray_iti_photodiode_off" if screen_gray_active else ""
         metadata["prestim_screen_open_before_camera"] = True
         metadata["prestim_raw_build_under_gray"] = raw_cache_built_with_screen_open
         metadata["prestim_minimum_gray_sec"] = base.INITIAL_GRAY_SEC
-        metadata["prestim_baseline_clock_reference"] = "camera_start_command_returned"
+        metadata["prestim_baseline_clock_reference"] = "camera_recording_confirmed"
         metadata["prestim_gray_on_utc"] = prestim_gray_on_utc
         metadata["prestim_gray_ready_utc"] = prestim_gray_ready_utc
-        metadata["camera_start_returned_utc"] = camera_start_returned_utc
         metadata["prestim_gray_before_camera_start_sec"] = (
             prestim_baseline_start_monotonic - prestim_gray_start_monotonic
             if prestim_baseline_start_monotonic is not None and prestim_gray_start_monotonic is not None

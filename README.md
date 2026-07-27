@@ -24,7 +24,7 @@ What the runtime does:
 - prints a terminal progress line with percent and ETA during playback
 - optionally bakes a photodiode patch into the frames
 - logs display-request timestamps for `stim_on` and `iti_on` while the photodiode remains the ground truth for physical onset
-- with the camera wrapper, puts the monitor on the ITI-style gray frame before camera start, records a pre-stimulus baseline while stimulus raws are prepared, and fetches files back to box 151
+- with the camera wrapper, keeps the monitor on the ITI-style gray frame while the camera is started and confirmed, records a pre-stimulus baseline while stimulus raws are prepared, then holds a black post-stimulus screen until you confirm the camera stop/fetch step
 - logs planned sequence, request timestamps, baseline metadata, and session metadata
 
 ## Default timing
@@ -103,7 +103,9 @@ python3 run_stringer_vstim_cam.py
 
 That wrapper now asks for a pre-stimulus camera baseline in minutes, then lets
 you type `y` and press Enter to start early while the camera is already
-recording.
+recording. After the stimulus sequence finishes, it leaves the screen black
+until you confirm camera stop and fetch, so the post-stimulus state stays
+quiet while the remote Pi is being cleaned up.
 
 Keep `run_stringer_vstim.py` around as the plain no-camera runner and as the
 baseline path if you want to debug the display flow independently.
