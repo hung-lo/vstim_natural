@@ -486,6 +486,7 @@ def start_camera(args):
             {
                 "camera_host": camera_host,
                 "camera_pid": state.get("camera_pid"),
+                "camera_pid_confirmed": True,
                 "camera_launch_timed_out": launch_timed_out,
                 "remote_pid_file": remote_pid_file,
                 "remote_log_file": remote_log,
@@ -521,7 +522,7 @@ def start_camera(args):
         raise RuntimeError("Camera recording did not become ready.") from exc
 
     append_event(local_video_dir, "camera_start_returned", state)
-    print("Camera recording confirmed.")
+    print("Camera acquisition process confirmed running.")
     print("Camera host:      %s" % camera_host)
     print("Remote video dir: %s" % paths["remote_video_dir"])
     print("Local video dir:  %s" % local_video_dir)

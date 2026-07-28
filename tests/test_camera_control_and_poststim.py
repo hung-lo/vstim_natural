@@ -142,10 +142,57 @@ class CameraControlAndPoststimTests(unittest.TestCase):
         self.assertEqual(state["camera_status"], "recording_confirmed")
         self.assertEqual(state["camera_pid"], 123)
 
+    def test_run_trial_sequence_can_skip_final_iti_for_camera_poststim(self):
+        screen = FakeScreen()
+        trials = [
+            {"trial_index": 1, "repeat_number": 1, "image_index": 0, "image_id": "img1", "image_filename": "img1.png", "image_path": "/tmp/img1.png", "planned_stim_duration_sec": 0.5, "planned_iti_duration_sec": 0.75},
+            {"trial_index": 2, "repeat_number": 1, "image_index": 1, "image_id": "img2", "image_filename": "img2.png", "image_path": "/tmp/img2.png", "planned_stim_duration_sec": 0.5, "planned_iti_duration_sec": 0.75},
+        ]
+        loaded_stim_raws = {"img1": "stim1", "img2": "stim2"}
+        stim_raw_paths = {"img1": Path("/stim1.raw"), "img2": Path("/stim2.raw")}
+        iti_raw_path = Path("/iti.raw")
+        event_types = []
+
+        def fake_display_raw_with_timing(screen_arg, raw):
+            screen_arg.display_raw(raw)
+            return (
+                types.SimpleNamespace(start_time=1.0, mean_interframe=2.0, stddev_interframe=3.0),
+                {
+                    "request_utc_iso": "now",
+                    "request_unix_sec": 1.0,
+                    "return_utc_iso": "later",
+                    "request_unix_ns": 10,
+                    "return_unix_ns": 20,
+                    "request_perf_counter_ns": 30,
+                    "return_perf_counter_ns": 40,
+                    "duration_sec": 0.5,
+                },
+            )
+
+        def fake_append_csv_row(path, row, fieldnames):
+            event_types.append(row["event_type"])
+
+        with patch.object(base, "display_raw_with_timing", side_effect=fake_display_raw_with_timing), patch.object(base, "append_csv_row", side_effect=fake_append_csv_row), patch(
+            "builtins.print"
+        ):
+            base.run_trial_sequence(
+                screen,
+                trials,
+                loaded_stim_raws,
+                "iti_raw",
+                stim_raw_paths,
+                iti_raw_path,
+                Path("/tmp/event.csv"),
+                include_final_iti=False,
+            )
+
+        self.assertEqual(screen.calls, [("display_raw", "stim1"), ("display_raw", "iti_raw"), ("display_raw", "stim2")])
+        self.assertEqual(event_types, ["stim_on", "iti_on", "stim_on"])
+
     def test_black_poststim_helper_keeps_screen_black_during_stop_and_fetch(self):
         screen = FakeScreen()
         event_types = []
-        prompt_results = [False, True]
+        prompt_results = [True]
 
         def fake_append_csv_row(path, row, fieldnames):
             event_types.append(row.get("event_type"))
@@ -171,17 +218,54 @@ class CameraControlAndPoststimTests(unittest.TestCase):
         self.assertEqual(stop_calls, ["stop"])
         self.assertEqual(fetch_calls, ["fetch"])
         self.assertEqual(event_types, [
-            "stimulus_playback_end",
+            "poststim_gray_start",
             "poststim_gray_end",
             "poststim_black_on",
             "camera_stop_requested",
             "camera_stop_confirmed",
+            "camera_fetch_started",
+            "camera_fetch_completed",
             "poststim_black_end",
             "session_end",
         ])
         self.assertTrue(result["camera_stop_confirmed"])
-        self.assertTrue(result["camera_fetched"])
+        self.assertTrue(result["camera_fetch_completed"])
         self.assertTrue(result["session_completed"])
+        self.assertFalse(result["camera_fetch_deferred"])
+        self.assertFalse(result["camera_left_running_by_user"])
+
+    def test_fetch_retry_does_not_call_stop_again(self):
+        screen = FakeScreen()
+        event_types = []
+        prompt_results = [True, True]
+
+        def fake_append_csv_row(path, row, fieldnames):
+            event_types.append(row.get("event_type"))
+
+        stop_calls = []
+        fetch_calls = []
+
+        def fake_stop_camera_recording():
+            stop_calls.append("stop")
+
+        def fake_fetch_camera_recording():
+            fetch_calls.append("fetch")
+            if len(fetch_calls) == 1:
+                raise RuntimeError("fetch failed")
+
+        with patch.object(base, "append_csv_row", side_effect=fake_append_csv_row), patch.object(base, "prompt_yes_no", side_effect=prompt_results), patch.object(
+            cam, "stop_camera_recording", side_effect=fake_stop_camera_recording
+        ), patch.object(cam, "fetch_camera_recording", side_effect=fake_fetch_camera_recording), patch.object(cam.time, "sleep", return_value=None), patch(
+            "builtins.print"
+        ):
+            result = cam.run_poststim_black_baseline(screen, "iti_raw", Path("/tmp/event_log.csv"))
+
+        self.assertEqual(stop_calls, ["stop"])
+        self.assertEqual(fetch_calls, ["fetch", "fetch"])
+        self.assertEqual(event_types.count("camera_fetch_started"), 2)
+        self.assertIn("camera_fetch_failed", event_types)
+        self.assertFalse(result["camera_fetch_deferred"])
+        self.assertTrue(result["camera_fetch_completed"])
 
 
 if __name__ == "__main__":

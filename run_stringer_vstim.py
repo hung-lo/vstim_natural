@@ -42,8 +42,9 @@ STIM_DURATION_SEC = 0.5
 ITI_DURATION_SEC = 0.75
 INITIAL_GRAY_SEC = 3.0
 FINAL_GRAY_SEC = 3.0
-POSTSTIM_TRANSITION_GRAY_SEC = FINAL_GRAY_SEC
+POSTSTIM_GRAY_PLANNED_SEC = FINAL_GRAY_SEC
 POSTSTIM_BLACK_LEVEL = 0
+POSTSTIM_TRANSITION_GRAY_SEC = POSTSTIM_GRAY_PLANNED_SEC
 
 ENABLE_PHOTODIODE_PATCH = True
 PHOTODIODE_SIZE_PX = 120
@@ -341,15 +342,15 @@ def make_display_event_row(event_type, trial, raw_path, planned_duration_sec, pe
     }
 
 
-def run_trial_sequence(screen, trials, loaded_stim_raws, iti_raw, stim_raw_paths, iti_raw_path, event_log_path, gpio=None):
+def run_trial_sequence(screen, trials, loaded_stim_raws, iti_raw, stim_raw_paths, iti_raw_path, event_log_path, gpio=None, include_final_iti=True):
     playback_start = time.perf_counter()
+    total_trials = len(trials)
     for trial_index, trial in enumerate(trials, start=1):
         stem = Path(trial["image_path"]).stem
         if gpio is not None:
             ttl_pulse(gpio)
 
         stim_perf, stim_timing = display_raw_with_timing(screen, loaded_stim_raws[stem])
-        iti_perf, iti_timing = display_raw_with_timing(screen, iti_raw)
 
         stim_row = make_display_event_row(
             "stim_on",
@@ -359,17 +360,22 @@ def run_trial_sequence(screen, trials, loaded_stim_raws, iti_raw, stim_raw_paths
             stim_perf,
             stim_timing,
         )
-        iti_row = make_display_event_row(
-            "iti_on",
-            trial,
-            iti_raw_path,
-            ITI_DURATION_SEC,
-            iti_perf,
-            iti_timing,
-        )
         append_csv_row(event_log_path, stim_row, EVENT_FIELDS)
-        append_csv_row(event_log_path, iti_row, EVENT_FIELDS)
-        print_progress(trial_index, len(trials), playback_start)
+
+        is_final_trial = trial_index == total_trials
+        if include_final_iti or not is_final_trial:
+            iti_perf, iti_timing = display_raw_with_timing(screen, iti_raw)
+            iti_row = make_display_event_row(
+                "iti_on",
+                trial,
+                iti_raw_path,
+                ITI_DURATION_SEC,
+                iti_perf,
+                iti_timing,
+            )
+            append_csv_row(event_log_path, iti_row, EVENT_FIELDS)
+
+        print_progress(trial_index, total_trials, playback_start)
 
 
 def build_stim_raw_cache(rpg_module, session_raw_dir, selected_image_files):

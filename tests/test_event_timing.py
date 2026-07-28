@@ -161,8 +161,8 @@ class EventTimingTests(unittest.TestCase):
             call_order,
             [
                 ("display", "stim-raw"),
-                ("display", "iti-raw"),
                 ("append", "stim_on"),
+                ("display", "iti-raw"),
                 ("append", "iti_on"),
                 ("progress", 1, 1),
             ],
