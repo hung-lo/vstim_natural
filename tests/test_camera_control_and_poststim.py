@@ -234,6 +234,102 @@ class CameraControlAndPoststimTests(unittest.TestCase):
         self.assertFalse(result["camera_fetch_deferred"])
         self.assertFalse(result["camera_left_running_by_user"])
 
+    def test_failed_stop_is_retried_instead_of_falling_through(self):
+        screen = FakeScreen()
+        event_types = []
+        prompt_results = [True, True]
+
+        def fake_append_csv_row(path, row, fieldnames):
+            event_types.append(row.get("event_type"))
+
+        stop_calls = []
+        fetch_calls = []
+
+        def fake_stop_camera_recording():
+            stop_calls.append("stop")
+            if len(stop_calls) == 1:
+                raise RuntimeError("stop failed")
+
+        def fake_fetch_camera_recording():
+            fetch_calls.append("fetch")
+
+        with patch.object(base, "append_csv_row", side_effect=fake_append_csv_row), patch.object(base, "prompt_yes_no", side_effect=prompt_results), patch.object(
+            cam, "stop_camera_recording", side_effect=fake_stop_camera_recording
+        ), patch.object(cam, "fetch_camera_recording", side_effect=fake_fetch_camera_recording), patch.object(cam.time, "sleep", return_value=None), patch(
+            "builtins.print"
+        ):
+            result = cam.run_poststim_black_baseline(screen, "iti_raw", Path("/tmp/event_log.csv"))
+
+        self.assertEqual(stop_calls, ["stop", "stop"])
+        self.assertEqual(fetch_calls, ["fetch"])
+        self.assertTrue(result["camera_stop_confirmed"])
+        self.assertFalse(result["camera_left_running_by_user"])
+        self.assertTrue(result["camera_fetch_completed"])
+        self.assertFalse(result["camera_fetch_deferred"])
+
+    def test_declining_retry_and_leave_running_keeps_prompting_until_stop_succeeds(self):
+        screen = FakeScreen()
+        event_types = []
+        prompt_results = [True, False, False, True]
+
+        def fake_append_csv_row(path, row, fieldnames):
+            event_types.append(row.get("event_type"))
+
+        stop_calls = []
+        fetch_calls = []
+
+        def fake_stop_camera_recording():
+            stop_calls.append("stop")
+            if len(stop_calls) == 1:
+                raise RuntimeError("stop failed")
+
+        def fake_fetch_camera_recording():
+            fetch_calls.append("fetch")
+
+        with patch.object(base, "append_csv_row", side_effect=fake_append_csv_row), patch.object(base, "prompt_yes_no", side_effect=prompt_results), patch.object(
+            cam, "stop_camera_recording", side_effect=fake_stop_camera_recording
+        ), patch.object(cam, "fetch_camera_recording", side_effect=fake_fetch_camera_recording), patch.object(cam.time, "sleep", return_value=None), patch(
+            "builtins.print"
+        ):
+            result = cam.run_poststim_black_baseline(screen, "iti_raw", Path("/tmp/event_log.csv"))
+
+        self.assertEqual(stop_calls, ["stop", "stop"])
+        self.assertEqual(fetch_calls, ["fetch"])
+        self.assertTrue(result["camera_stop_confirmed"])
+        self.assertFalse(result["camera_left_running_by_user"])
+        self.assertTrue(result["camera_fetch_completed"])
+        self.assertFalse(result["camera_fetch_deferred"])
+
+    def test_keyboard_interrupt_during_fetch_marks_fetch_deferred(self):
+        screen = FakeScreen()
+        event_types = []
+
+        def fake_append_csv_row(path, row, fieldnames):
+            event_types.append(row.get("event_type"))
+
+        stop_calls = []
+
+        def fake_stop_camera_recording():
+            stop_calls.append("stop")
+
+        def fake_fetch_camera_recording():
+            raise KeyboardInterrupt()
+
+        with patch.object(base, "append_csv_row", side_effect=fake_append_csv_row), patch.object(base, "prompt_yes_no", side_effect=[True]), patch.object(
+            cam, "stop_camera_recording", side_effect=fake_stop_camera_recording
+        ), patch.object(cam, "fetch_camera_recording", side_effect=fake_fetch_camera_recording), patch.object(cam.time, "sleep", return_value=None), patch(
+            "builtins.print"
+        ):
+            result = cam.run_poststim_black_baseline(screen, "iti_raw", Path("/tmp/event_log.csv"))
+
+        self.assertEqual(stop_calls, ["stop"])
+        self.assertTrue(result["camera_stop_confirmed"])
+        self.assertFalse(result["camera_fetch_completed"])
+        self.assertTrue(result["camera_fetch_deferred"])
+        self.assertTrue(result["session_completed"])
+        self.assertFalse(result["camera_left_running_by_user"])
+        self.assertIn("camera_fetch_deferred", event_types)
+
     def test_fetch_retry_does_not_call_stop_again(self):
         screen = FakeScreen()
         event_types = []

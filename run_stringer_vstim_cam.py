@@ -336,125 +336,156 @@ def run_poststim_black_baseline(screen, iti_raw, event_log_path, stimulus_playba
             base.EVENT_FIELDS,
         )
 
-    try:
+    def resolve_camera_stop_before_exit(reason):
+        nonlocal camera_stop_confirmed
+        nonlocal camera_left_running_by_user
+
         while not camera_stop_confirmed and not camera_left_running_by_user:
-            try:
-                should_stop = base.prompt_yes_no(
-                    "Stop camera recording and end the black post-stimulus baseline now",
-                    default_yes=False,
-                )
-            except KeyboardInterrupt:
-                print("Keyboard interrupt during black baseline. Attempting to stop camera while keeping the screen black.")
-                record_stop_request("keyboard_interrupt_during_poststim_black")
-                try:
-                    stop_camera_recording()
-                    camera_stop_confirmed = True
-                    record_stop_confirmed("keyboard_interrupt_during_poststim_black")
-                except Exception as exc:
-                    print("ERROR stopping camera after KeyboardInterrupt: %s" % exc, file=sys.stderr)
-                    if base.prompt_yes_no("Leave the camera running and exit post-stimulus cleanup", default_yes=False):
-                        camera_left_running_by_user = True
-                        base.append_csv_row(
-                            event_log_path,
-                            {
-                                "event_type": "camera_left_running",
-                                "notes": "keyboard_interrupt_during_poststim_black",
-                            },
-                            base.EVENT_FIELDS,
-                        )
-                    continue
-                break
-
-            if not should_stop:
-                print("Black post-stimulus baseline continues. Type y and Enter when ready to stop.")
-                continue
-
-            record_stop_request("poststim_black_active=true")
+            record_stop_request(reason)
             try:
                 stop_camera_recording()
                 camera_stop_confirmed = True
-                record_stop_confirmed("poststim_black_active=true")
+                record_stop_confirmed(reason)
+                break
+            except KeyboardInterrupt:
+                print("ERROR stopping camera: KeyboardInterrupt while stopping camera", file=sys.stderr)
             except Exception as exc:
                 print("ERROR stopping camera: %s" % exc, file=sys.stderr)
-                print("Black post-stimulus baseline continues. Type y and Enter when ready to retry.")
 
-        if camera_stop_confirmed and not camera_left_running_by_user:
-            while True:
-                camera_fetch_started = True
-                base.append_csv_row(
-                    event_log_path,
-                    {
-                        "event_type": "camera_fetch_started",
-                        "notes": "poststim_black_active=true",
-                    },
-                    base.EVENT_FIELDS,
-                )
-                try:
-                    time.sleep(2.0)
-                    fetch_camera_recording()
-                    camera_fetch_completed = True
-                    poststim_black_ended_after_fetch = True
-                    base.append_csv_row(
-                        event_log_path,
-                        {
-                            "event_type": "camera_fetch_completed",
-                            "notes": "poststim_black_active=true",
-                        },
-                        base.EVENT_FIELDS,
-                    )
-                    break
-                except Exception as exc:
-                    camera_fetch_completed = False
-                    print("ERROR fetching camera: %s" % exc, file=sys.stderr)
-                    base.append_csv_row(
-                        event_log_path,
-                        {
-                            "event_type": "camera_fetch_failed",
-                            "notes": "poststim_black_active=true; error=%s" % exc,
-                        },
-                        base.EVENT_FIELDS,
-                    )
-                    if base.prompt_yes_no("Retry fetch while keeping the screen black", default_yes=True):
-                        continue
-                    camera_fetch_deferred = True
-                    base.append_csv_row(
-                        event_log_path,
-                        {
-                            "event_type": "camera_fetch_deferred",
-                            "notes": "poststim_black_active=true; left_on_camera_pi=true",
-                        },
-                        base.EVENT_FIELDS,
-                    )
-                    print("Leaving black baseline without fetched files.")
-                    break
-    except KeyboardInterrupt:
-        print("Keyboard interrupt during black baseline. Attempting to stop camera before leaving the screen.")
-        if not camera_stop_confirmed and not camera_left_running_by_user:
-            record_stop_request("keyboard_interrupt_during_poststim_black")
             try:
-                stop_camera_recording()
-                camera_stop_confirmed = True
-                record_stop_confirmed("keyboard_interrupt_during_poststim_black")
-            except Exception as exc:
-                print("ERROR stopping camera after KeyboardInterrupt: %s" % exc, file=sys.stderr)
-                if base.prompt_yes_no("Leave the camera running and exit post-stimulus cleanup", default_yes=False):
+                if base.prompt_yes_no(
+                    "Retry stopping the camera while keeping the screen black",
+                    default_yes=True,
+                ):
+                    continue
+            except KeyboardInterrupt:
+                print("Keyboard interrupt while choosing whether to retry stopping the camera.")
+                continue
+
+            try:
+                if base.prompt_yes_no(
+                    "Explicitly leave the camera running and exit post-stimulus cleanup",
+                    default_yes=False,
+                ):
                     camera_left_running_by_user = True
                     base.append_csv_row(
                         event_log_path,
                         {
                             "event_type": "camera_left_running",
-                            "notes": "keyboard_interrupt_during_poststim_black",
+                            "notes": "reason=%s; explicitly_confirmed=true" % reason,
                         },
                         base.EVENT_FIELDS,
                     )
+                    break
+            except KeyboardInterrupt:
+                print("Keyboard interrupt while choosing whether to leave the camera running.")
+                continue
+
+            print(
+                "The camera must either be stopped or explicitly left running. "
+                "The screen will remain black."
+            )
+
+    while not camera_stop_confirmed and not camera_left_running_by_user:
+        try:
+            should_stop = base.prompt_yes_no(
+                "Stop camera recording and end the black post-stimulus baseline now",
+                default_yes=False,
+            )
+        except KeyboardInterrupt:
+            print(
+                "Keyboard interrupt during black baseline. Resolving camera state while keeping the screen black."
+            )
+            resolve_camera_stop_before_exit("keyboard_interrupt_during_poststim_black")
+            break
+
+        if not should_stop:
+            print("Black post-stimulus baseline continues. Type y and Enter when ready to stop.")
+            continue
+
+        resolve_camera_stop_before_exit("poststim_black_active=true")
+
+    if camera_stop_confirmed and not camera_left_running_by_user:
+        while True:
+            camera_fetch_started = True
+            base.append_csv_row(
+                event_log_path,
+                {
+                    "event_type": "camera_fetch_started",
+                    "notes": "poststim_black_active=true",
+                },
+                base.EVENT_FIELDS,
+            )
+            try:
+                time.sleep(2.0)
+                fetch_camera_recording()
+                camera_fetch_completed = True
+                poststim_black_ended_after_fetch = True
+                base.append_csv_row(
+                    event_log_path,
+                    {
+                        "event_type": "camera_fetch_completed",
+                        "notes": "poststim_black_active=true",
+                    },
+                    base.EVENT_FIELDS,
+                )
+                break
+            except KeyboardInterrupt:
+                camera_fetch_completed = False
+                camera_fetch_deferred = True
+                base.append_csv_row(
+                    event_log_path,
+                    {
+                        "event_type": "camera_fetch_deferred",
+                        "notes": "poststim_black_active=true; left_on_camera_pi=true; reason=keyboard_interrupt",
+                    },
+                    base.EVENT_FIELDS,
+                )
+                print(
+                    "Camera is stopped. Fetch was interrupted; files remain on the camera Pi for later retrieval."
+                )
+                break
+            except Exception as exc:
+                camera_fetch_completed = False
+                print("ERROR fetching camera: %s" % exc, file=sys.stderr)
+                base.append_csv_row(
+                    event_log_path,
+                    {
+                        "event_type": "camera_fetch_failed",
+                        "notes": "poststim_black_active=true; error=%s" % exc,
+                    },
+                    base.EVENT_FIELDS,
+                )
+                if base.prompt_yes_no("Retry fetch while keeping the screen black", default_yes=True):
+                    continue
+                camera_fetch_deferred = True
+                base.append_csv_row(
+                    event_log_path,
+                    {
+                        "event_type": "camera_fetch_deferred",
+                        "notes": "poststim_black_active=true; left_on_camera_pi=true",
+                    },
+                    base.EVENT_FIELDS,
+                )
+                print("Leaving black baseline without fetched files.")
+                break
+
+    if not (camera_stop_confirmed or camera_left_running_by_user):
+        raise RuntimeError("Post-stimulus cleanup invariant violated: camera state unresolved")
 
     poststim_black_actual_sec = time.monotonic() - poststim_black_start_monotonic
     base.append_csv_row(
         event_log_path,
         {
             "event_type": "poststim_black_end",
-            "notes": "actual_sec=%.6f; camera_stop_confirmed=%s; camera_fetch_completed=%s; camera_left_running_by_user=%s"
-            % (poststim_black_actual_sec, camera_stop_confirmed, camera_fetch_completed, camera_left_running_by_user),
+            "notes": "actual_sec=%.6f; camera_stop_confirmed=%s; camera_fetch_completed=%s; camera_fetch_deferred=%s; camera_left_running_by_user=%s"
+            % (
+                poststim_black_actual_sec,
+                camera_stop_confirmed,
+                camera_fetch_completed,
+                camera_fetch_deferred,
+                camera_left_running_by_user,
+            ),
         },
         base.EVENT_FIELDS,
     )
@@ -462,8 +493,14 @@ def run_poststim_black_baseline(screen, iti_raw, event_log_path, stimulus_playba
         event_log_path,
         {
             "event_type": "session_end",
-            "notes": "stimulus_playback_completed=%s; camera_stop_confirmed=%s; camera_fetch_completed=%s; camera_fetch_deferred=%s"
-            % (stimulus_playback_completed, camera_stop_confirmed, camera_fetch_completed, camera_fetch_deferred),
+            "notes": "stimulus_playback_completed=%s; camera_stop_confirmed=%s; camera_left_running_by_user=%s; camera_fetch_completed=%s; camera_fetch_deferred=%s"
+            % (
+                stimulus_playback_completed,
+                camera_stop_confirmed,
+                camera_left_running_by_user,
+                camera_fetch_completed,
+                camera_fetch_deferred,
+            ),
         },
         base.EVENT_FIELDS,
     )
