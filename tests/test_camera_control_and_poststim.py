@@ -133,7 +133,13 @@ class CameraControlAndPoststimTests(unittest.TestCase):
             rc, "resolve_camera_host", return_value="pi@host"
         ), patch.object(rc, "save_state", side_effect=record_save), patch.object(rc, "append_event", side_effect=record_event), patch.object(
             rc, "run_ssh", side_effect=fake_run_ssh
-        ), patch.object(rc, "wait_for_remote_camera_ready", return_value={"camera_pid": 123, "stdout": "RUNNING:123", "returncode": 0}), patch("builtins.print"):
+        ), patch.object(rc, "wait_for_remote_camera_ready", return_value={"camera_pid": 123, "stdout": "RUNNING:123", "returncode": 0}), patch.object(
+            rc,
+            "wait_for_remote_camera_output_growth",
+            return_value={"camera_output_file": "/remote/session.h264", "initial_size_bytes": 100,
+                          "confirmed_size_bytes": 500, "camera_output_file_detected": True,
+                          "camera_output_growing_confirmed": True},
+        ), patch("builtins.print"):
             state = rc.start_camera(args)
 
         self.assertEqual(calls[0], ("event", "camera_start_requested"))
@@ -142,6 +148,8 @@ class CameraControlAndPoststimTests(unittest.TestCase):
         self.assertEqual(state["camera_status"], "recording_confirmed")
         self.assertEqual(state["camera_pid"], 123)
 
+        self.assertTrue(state["camera_pid_confirmed"])
+        self.assertTrue(state["camera_output_growing_confirmed"])
     def test_run_trial_sequence_can_skip_final_iti_for_camera_poststim(self):
         screen = FakeScreen()
         trials = [
@@ -364,5 +372,202 @@ class CameraControlAndPoststimTests(unittest.TestCase):
         self.assertTrue(result["camera_fetch_completed"])
 
 
+
+    def test_keyboard_interrupt_at_fetch_retry_prompt_defers_once(self):
+        screen = FakeScreen()
+        events = []
+        stop_calls = []
+        fetch_calls = []
+
+        def fake_append_csv_row(path, row, fieldnames):
+            events.append(row)
+
+        def fake_stop_camera_recording():
+            stop_calls.append("stop")
+
+        def fake_fetch_camera_recording():
+            fetch_calls.append("fetch")
+            raise RuntimeError("fetch failed")
+
+        with patch.object(base, "append_csv_row", side_effect=fake_append_csv_row), patch.object(
+            base, "prompt_yes_no", side_effect=[True, KeyboardInterrupt()]
+        ), patch.object(cam, "stop_camera_recording", side_effect=fake_stop_camera_recording), patch.object(
+            cam, "fetch_camera_recording", side_effect=fake_fetch_camera_recording
+        ), patch.object(cam.time, "sleep", return_value=None), patch("builtins.print"):
+            result = cam.run_poststim_black_baseline(screen, "iti_raw", Path("/tmp/event_log.csv"))
+
+        event_types = [row["event_type"] for row in events]
+        self.assertEqual(stop_calls, ["stop"])
+        self.assertEqual(fetch_calls, ["fetch"])
+        self.assertTrue(result["camera_stop_confirmed"])
+        self.assertFalse(result["camera_fetch_completed"])
+        self.assertTrue(result["camera_fetch_deferred"])
+        self.assertTrue(result["session_completed"])
+        self.assertEqual(event_types.count("camera_fetch_deferred"), 1)
+        self.assertLess(event_types.index("camera_fetch_failed"), event_types.index("camera_fetch_deferred"))
+        self.assertLess(event_types.index("camera_fetch_deferred"), event_types.index("poststim_black_end"))
+
+    def test_start_wrapper_uses_emergency_timeout_and_structured_confirmation(self):
+        captured = {}
+        state = {
+            "camera_pid_confirmed": True,
+            "camera_output_growing_confirmed": True,
+            "camera_output_file": "/remote/session.h264",
+        }
+        stdout = cam.CAMERA_CONTROL_RESULT_PREFIX + __import__("json").dumps(state) + "\n"
+
+        def fake_run_camera_control(args, background=False, timeout=None):
+            captured["args"] = args
+            captured["timeout"] = timeout
+            return subprocess.CompletedProcess(args, 0, stdout=stdout, stderr="")
+
+        with patch.object(cam, "run_camera_control", side_effect=fake_run_camera_control), patch("builtins.print"):
+            result = cam.start_camera_recording("mouse", "session")
+
+        self.assertGreaterEqual(captured["timeout"], 60.0)
+        self.assertIn("--json", captured["args"])
+        self.assertEqual(result["camera_output_file"], "/remote/session.h264")
+
+    def test_start_failure_recovery_confirms_cleanup_without_starting(self):
+        events = []
+        stopped_state = {"camera_stop_confirmed": True, "camera_status": "stopped_confirmed"}
+
+        with patch.object(cam, "start_camera_recording", side_effect=RuntimeError("start timeout")), patch.object(
+            cam, "stop_camera_recording", return_value=stopped_state
+        ) as stop_mock, patch.object(
+            base, "append_csv_row", side_effect=lambda path, row, fields: events.append(row["event_type"])
+        ), patch("builtins.print"):
+            result = cam.start_camera_recording_with_recovery("mouse", "session", Path("/tmp/event.csv"))
+
+        self.assertFalse(result["confirmed_running"])
+        self.assertTrue(result["cleanup_attempted"])
+        self.assertTrue(result["cleanup_confirmed"])
+        self.assertFalse(result["camera_state_unknown_acknowledged"])
+        stop_mock.assert_called_once_with()
+        self.assertIn("camera_start_failed", events)
+        self.assertIn("camera_cleanup_after_start_failure_confirmed", events)
+
+    def test_output_growth_requires_same_file_to_increase(self):
+        probes = iter(["", "/remote/session.h264\t100\n", "/remote/session.h264\t500\n"])
+
+        def fake_run_ssh(camera_host, remote_cmd, check=True, dry_run=False, timeout=None):
+            if remote_cmd.startswith("find "):
+                return subprocess.CompletedProcess(["ssh"], 0, stdout=next(probes), stderr="")
+            return subprocess.CompletedProcess(["ssh"], 0, stdout="RUNNING:123\n", stderr="")
+
+        with patch.object(rc, "run_ssh", side_effect=fake_run_ssh), patch.object(rc.time, "sleep", return_value=None):
+            result = rc.wait_for_remote_camera_output_growth(
+                "pi@host", "/remote/camera.pid", "/remote", "/remote/camera.log", timeout_sec=1.0
+            )
+
+        self.assertTrue(result["camera_output_file_detected"])
+        self.assertTrue(result["camera_output_growing_confirmed"])
+        self.assertEqual(result["initial_size_bytes"], 100)
+        self.assertEqual(result["confirmed_size_bytes"], 500)
+
+    def test_static_output_is_not_ready(self):
+        clock = iter([0.0, 0.0, 2.0])
+
+        def fake_run_ssh(camera_host, remote_cmd, check=True, dry_run=False, timeout=None):
+            if remote_cmd.startswith("find "):
+                return subprocess.CompletedProcess(["ssh"], 0, stdout="/remote/session.h264\t100\n", stderr="")
+            return subprocess.CompletedProcess(["ssh"], 0, stdout="RUNNING:123\n", stderr="")
+
+        with patch.object(rc, "run_ssh", side_effect=fake_run_ssh), patch.object(
+            rc.time, "monotonic", side_effect=lambda: next(clock)
+        ), patch.object(rc.time, "sleep", return_value=None), patch.object(rc, "tail_remote_log", return_value="camera log"):
+            with self.assertRaisesRegex(RuntimeError, "did not grow"):
+                rc.wait_for_remote_camera_output_growth(
+                    "pi@host", "/remote/camera.pid", "/remote", "/remote/camera.log", timeout_sec=1.0
+                )
+
+    def test_pid_death_aborts_output_readiness_immediately(self):
+        with patch.object(
+            rc,
+            "run_ssh",
+            return_value=subprocess.CompletedProcess(["ssh"], 1, stdout="NOT_RUNNING\n", stderr=""),
+        ), patch.object(rc, "tail_remote_log", return_value="camera failed"):
+            with self.assertRaisesRegex(RuntimeError, "process stopped"):
+                rc.wait_for_remote_camera_output_growth(
+                    "pi@host", "/remote/camera.pid", "/remote", "/remote/camera.log", timeout_sec=1.0
+                )
+
+    def test_stop_verification_polls_until_session_process_is_gone(self):
+        results = iter([
+            subprocess.CompletedProcess(["ssh"], 1, stdout="STILL_RUNNING\n", stderr=""),
+            subprocess.CompletedProcess(["ssh"], 1, stdout="STILL_RUNNING\n", stderr=""),
+            subprocess.CompletedProcess(["ssh"], 0, stdout="STOPPED\n", stderr=""),
+        ])
+
+        with patch.object(rc, "run_ssh", side_effect=lambda *args, **kwargs: next(results)) as run_mock, patch.object(
+            rc.time, "sleep", return_value=None
+        ):
+            result = rc.wait_for_remote_camera_stopped(
+                "pi@host", 123, "/remote/session", "/remote/camera.log", timeout_sec=1.0
+            )
+
+        self.assertTrue(result["camera_stop_confirmed"])
+        self.assertEqual(run_mock.call_count, 3)
+
+    def test_stop_camera_removes_pid_file_only_after_verification(self):
+        args = argparse.Namespace(
+            camera_host="pi@host", remote_camera_stop="/repo/stop.sh", ignore_stop_errors=False, dry_run=False
+        )
+        state = {
+            "camera_host": "pi@host",
+            "camera_pid": 123,
+            "remote_pid_file": "/remote/camera.pid",
+            "remote_base_path": "/remote/session",
+            "remote_video_dir": "/remote",
+            "remote_log_file": "/remote/camera.log",
+            "local_video_dir": "/tmp/camera-stop-test",
+        }
+        commands = []
+
+        def fake_run_ssh(camera_host, remote_cmd, check=True, dry_run=False, timeout=None):
+            commands.append(remote_cmd)
+            return subprocess.CompletedProcess(["ssh"], 0, stdout="", stderr="")
+
+        with patch.object(rc, "run_ssh", side_effect=fake_run_ssh), patch.object(
+            rc, "wait_for_remote_camera_stopped", return_value={"camera_stop_confirmed": True}
+        ) as verify_mock, patch.object(rc, "save_state"), patch.object(rc, "append_event"), patch("builtins.print"):
+            result = rc.stop_camera(args, state)
+
+        self.assertTrue(result["camera_stop_confirmed"])
+        self.assertEqual(result["camera_status"], "stopped_confirmed")
+        verify_mock.assert_called_once()
+        self.assertNotIn("rm -f", commands[0])
+        self.assertTrue(commands[-1].startswith("rm -f "))
+
+    def test_ignore_stop_errors_never_creates_false_confirmation(self):
+        args = argparse.Namespace(
+            camera_host="pi@host", remote_camera_stop="/repo/stop.sh", ignore_stop_errors=True, dry_run=False
+        )
+        state = {
+            "camera_host": "pi@host",
+            "camera_pid": 123,
+            "remote_pid_file": "/remote/camera.pid",
+            "remote_base_path": "/remote/session",
+            "remote_video_dir": "/remote",
+            "remote_log_file": "/remote/camera.log",
+            "local_video_dir": "/tmp/camera-stop-ignore-test",
+        }
+
+        with patch.object(
+            rc, "run_ssh", return_value=subprocess.CompletedProcess(["ssh"], 0, stdout="", stderr="")
+        ), patch.object(
+            rc, "wait_for_remote_camera_stopped", side_effect=RuntimeError("still running")
+        ), patch.object(rc, "save_state"), patch.object(rc, "append_event"), patch("builtins.print"):
+            result = rc.stop_camera(args, state)
+
+        self.assertEqual(result["camera_status"], "stop_unverified")
+        self.assertFalse(result["camera_stop_confirmed"])
+
+    def test_stopped_check_is_scoped_to_expected_pid_and_session_path(self):
+        command = rc.build_remote_camera_stopped_check_command(123, "/remote/session/video/session")
+        self.assertIn("kill -0", command)
+        self.assertIn("123", command)
+        self.assertIn("/remote/session/video/session", command)
+        self.assertIn("grep -F", command)
 if __name__ == "__main__":
     unittest.main()

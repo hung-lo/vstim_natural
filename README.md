@@ -102,10 +102,13 @@ python3 run_stringer_vstim_cam.py
 ```
 
 That wrapper now asks for a pre-stimulus camera baseline in minutes, then lets
-you type `y` and press Enter to start early while the camera is already
-recording. After the stimulus sequence finishes, it leaves the screen black
-until you confirm camera stop and fetch, so the post-stimulus state stays
-quiet while the remote Pi is being cleaned up.
+you type `y` and press Enter to start early after the camera process is alive
+and its session-specific `.h264` file is confirmed to be growing. The baseline
+clock starts from that output-growth confirmation. After the stimulus sequence
+finishes, it leaves the screen black until camera stop is verified by both the
+tracked PID and the session-specific acquisition-process check. The PID file is
+removed only after that verification, and the screen remains black during file
+transfer or while a failed transfer is being resolved.
 
 Keep `run_stringer_vstim.py` around as the plain no-camera runner and as the
 baseline path if you want to debug the display flow independently.

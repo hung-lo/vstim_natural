@@ -58,12 +58,19 @@ CAMERA_START_LAUNCH_TIMEOUT_SEC = 10.0
 CAMERA_START_READY_TIMEOUT_SEC = 8.0
 CAMERA_READY_POLL_SEC = 0.25
 CAMERA_LOG_TAIL_LINES = 50
+CAMERA_OUTPUT_READY_TIMEOUT_SEC = 12.0
+CAMERA_OUTPUT_READY_POLL_SEC = 0.5
+CAMERA_OUTPUT_MIN_BYTES = 1
+CAMERA_OUTPUT_GLOB = "*.h264"
 CAMERA_STOP_TIMEOUT_SEC = 10.0
 CAMERA_PREVIEW_LAUNCH_TIMEOUT_SEC = 10.0
+CAMERA_STOP_VERIFY_TIMEOUT_SEC = 8.0
+CAMERA_STOP_VERIFY_POLL_SEC = 0.25
 CAMERA_PREVIEW_STOP_TIMEOUT_SEC = 5.0
 SESSION_NAME_SUFFIX = "vstim_natural"
 
 CAMERA_FRAMERATE = 30
+JSON_RESULT_PREFIX = "CAMERA_CONTROL_RESULT_JSON="
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 STATE_FILE = LOCAL_VIDEO_ROOT / ".last_remote_camera_session.json"
@@ -160,9 +167,34 @@ def build_remote_camera_stop_command(pid_file, remote_stop_script):
         ";; "
         "*) echo 'PID file does not match expected acquisition process; falling back to stop script' >&2; ;; "
         "esac; "
-        f"rm -f {shlex.quote(pid_file)}; "
         "fi; "
         f"bash {shlex.quote(remote_stop_script)}"
+    )
+
+
+
+def build_remote_camera_stopped_check_command(expected_pid, remote_base_path):
+    expected_pid_text = "" if expected_pid is None else str(int(expected_pid))
+    return (
+        "pid_alive=0; "
+        "expected_pid=%s; "
+        "if [ -n \"$expected_pid\" ] && kill -0 \"$expected_pid\" 2>/dev/null; then pid_alive=1; fi; "
+        "matches=$(pgrep -af '[s]tart_acquisition.py' | grep -F -- %s || true); "
+        "if [ \"$pid_alive\" -eq 0 ] && [ -z \"$matches\" ]; then "
+        "echo STOPPED; exit 0; "
+        "fi; "
+        "echo STILL_RUNNING; "
+        "if [ -n \"$matches\" ]; then echo \"$matches\"; fi; "
+        "exit 1"
+        % (shlex.quote(expected_pid_text), shlex.quote(remote_base_path))
+    )
+
+
+def build_remote_output_probe_command(remote_video_dir):
+    return (
+        "find %s -maxdepth 1 -type f -name %s "
+        "-printf '%%p\\t%%s\\n' 2>/dev/null | sort"
+        % (shlex.quote(remote_video_dir), shlex.quote(CAMERA_OUTPUT_GLOB))
     )
 
 
@@ -174,6 +206,17 @@ def parse_camera_pid(stdout):
     if match:
         return int(match.group(1))
     return None
+
+
+def parse_remote_output_probe(stdout):
+    files = {}
+    for line in (stdout or "").splitlines():
+        try:
+            path, size_text = line.rsplit("\t", 1)
+            files[path] = int(size_text)
+        except (TypeError, ValueError):
+            continue
+    return files
 
 
 def tail_remote_log(camera_host, log_file, dry_run=False):
@@ -217,6 +260,121 @@ def wait_for_remote_camera_ready(camera_host, pid_file, log_file, dry_run=False,
     raise RuntimeError(
         "Camera did not report ready within %.1f seconds. Last remote log tail:\n%s"
         % (timeout_sec, tail or last_output or "<no output>")
+    )
+
+
+def wait_for_remote_camera_output_growth(
+    camera_host,
+    pid_file,
+    remote_video_dir,
+    log_file,
+    dry_run=False,
+    timeout_sec=CAMERA_OUTPUT_READY_TIMEOUT_SEC,
+):
+    if dry_run:
+        return {
+            "camera_output_file": None,
+            "initial_size_bytes": 0,
+            "confirmed_size_bytes": CAMERA_OUTPUT_MIN_BYTES,
+            "camera_output_file_detected": True,
+            "camera_output_growing_confirmed": True,
+        }
+
+    deadline = time.monotonic() + float(timeout_sec)
+    first_sizes = {}
+    last_output = ""
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+
+        pid_result = run_ssh(
+            camera_host,
+            build_remote_pid_check_command(pid_file),
+            check=False,
+            dry_run=dry_run,
+            timeout=min(2.0, max(0.2, remaining)) + 2.0,
+        )
+        if pid_result.returncode != 0:
+            tail = tail_remote_log(camera_host, log_file, dry_run=dry_run)
+            raise RuntimeError(
+                "Camera process stopped while waiting for video output growth. "
+                "Last remote log tail:\n%s" % (tail or "<no output>")
+            )
+
+        probe_result = run_ssh(
+            camera_host,
+            build_remote_output_probe_command(remote_video_dir),
+            check=False,
+            dry_run=dry_run,
+            timeout=min(2.0, max(0.2, remaining)) + 2.0,
+        )
+        last_output = (probe_result.stdout or "") + (probe_result.stderr or "")
+        current_sizes = parse_remote_output_probe(probe_result.stdout)
+        for path, current_size in current_sizes.items():
+            if path not in first_sizes:
+                first_sizes[path] = current_size
+                continue
+            initial_size = first_sizes[path]
+            if current_size >= CAMERA_OUTPUT_MIN_BYTES and current_size > initial_size:
+                return {
+                    "camera_output_file": path,
+                    "initial_size_bytes": initial_size,
+                    "confirmed_size_bytes": current_size,
+                    "camera_output_file_detected": True,
+                    "camera_output_growing_confirmed": True,
+                }
+
+        time.sleep(min(CAMERA_OUTPUT_READY_POLL_SEC, max(0.0, remaining)))
+
+    tail = tail_remote_log(camera_host, log_file, dry_run=dry_run)
+    detected = bool(first_sizes)
+    raise RuntimeError(
+        "Camera video output %s within %.1f seconds. Last probe output:\n%s\n"
+        "Last remote log tail:\n%s"
+        % (
+            "did not grow" if detected else "was not detected",
+            timeout_sec,
+            last_output or "<no output>",
+            tail or "<no output>",
+        )
+    )
+
+
+def wait_for_remote_camera_stopped(
+    camera_host,
+    expected_pid,
+    remote_base_path,
+    log_file,
+    dry_run=False,
+    timeout_sec=CAMERA_STOP_VERIFY_TIMEOUT_SEC,
+):
+    if dry_run:
+        return {"camera_stop_confirmed": True, "stdout": "[dry-run]"}
+
+    deadline = time.monotonic() + float(timeout_sec)
+    last_output = ""
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        result = run_ssh(
+            camera_host,
+            build_remote_camera_stopped_check_command(expected_pid, remote_base_path),
+            check=False,
+            dry_run=dry_run,
+            timeout=min(2.0, max(0.2, remaining)) + 2.0,
+        )
+        last_output = (result.stdout or "") + (result.stderr or "")
+        if result.returncode == 0:
+            return {"camera_stop_confirmed": True, "stdout": last_output}
+        time.sleep(min(CAMERA_STOP_VERIFY_POLL_SEC, max(0.0, remaining)))
+
+    tail = tail_remote_log(camera_host, log_file, dry_run=dry_run)
+    raise RuntimeError(
+        "Camera stop could not be verified within %.1f seconds. "
+        "Last process check:\n%s\nLast remote log tail:\n%s"
+        % (timeout_sec, last_output or "<no output>", tail or "<no output>")
     )
 
 
@@ -402,8 +560,15 @@ def start_camera(args):
         "remote_camera_stop": args.remote_camera_stop,
         "camera_status": "launch_requested",
         "camera_pid": None,
+        "camera_start_command_returned": False,
+        "camera_pid_confirmed": False,
+        "camera_process_confirmed": False,
+        "camera_output_file_detected": False,
+        "camera_output_growing_confirmed": False,
+        "camera_start_failed": False,
         "camera_start_requested_utc": utc_iso_now(),
         "camera_launch_returned_utc": None,
+        "camera_output_growth_confirmed_utc": None,
         "camera_start_confirmed_utc": None,
         **paths,
     }
@@ -432,6 +597,7 @@ def start_camera(args):
             timeout=CAMERA_START_LAUNCH_TIMEOUT_SEC,
         )
         launch_stdout = launch_result.stdout or ""
+        state["camera_start_command_returned"] = True
         state["camera_status"] = "launch_returned"
         state["camera_launch_returned_utc"] = utc_iso_now()
         state["camera_pid"] = parse_camera_pid(launch_stdout) or state.get("camera_pid")
@@ -444,13 +610,14 @@ def start_camera(args):
                 "launch_stdout": launch_stdout,
             },
         )
-    except RuntimeError as exc:
+    except Exception as exc:
         if "timed out" in str(exc).lower():
             launch_timed_out = True
             state["camera_launch_timed_out"] = True
             print("Camera launch SSH timed out; checking whether the remote process still started.")
             save_state(state)
         else:
+            state["camera_start_failed"] = True
             state["camera_status"] = "start_failed"
             state["camera_start_failed_utc"] = utc_iso_now()
             state["camera_start_error"] = str(exc)
@@ -463,7 +630,20 @@ def start_camera(args):
                     "error": str(exc),
                 },
             )
-            raise
+            try:
+                state["camera_cleanup_after_start_failure_attempted"] = True
+                stop_camera(args, state)
+                state["camera_cleanup_after_start_failure_confirmed"] = True
+                save_state(state)
+            except Exception as cleanup_exc:
+                state["camera_cleanup_after_start_failure_confirmed"] = False
+                state["camera_cleanup_after_start_failure_error"] = str(cleanup_exc)
+                save_state(state)
+                raise RuntimeError(
+                    "Camera launch failed, and cleanup could not be confirmed: %s"
+                    % cleanup_exc
+                ) from exc
+            raise RuntimeError("Camera launch failed; cleanup was confirmed.") from exc
 
     try:
         ready = wait_for_remote_camera_ready(
@@ -476,8 +656,39 @@ def start_camera(args):
         camera_pid = ready.get("camera_pid")
         if camera_pid is not None:
             state["camera_pid"] = camera_pid
+        state["camera_status"] = "process_confirmed"
+        state["camera_pid_confirmed"] = True
+        state["camera_process_confirmed"] = True
+        state["camera_process_confirmed_utc"] = utc_iso_now()
+        save_state(state)
+        append_event(
+            local_video_dir,
+            "camera_process_confirmed",
+            {
+                "camera_host": camera_host,
+                "camera_pid": state.get("camera_pid"),
+                "remote_pid_file": remote_pid_file,
+            },
+        )
+        print("Camera acquisition process is running; waiting for video output...")
+
+        output_ready = wait_for_remote_camera_output_growth(
+            camera_host,
+            remote_pid_file,
+            paths["remote_video_dir"],
+            remote_log,
+            dry_run=args.dry_run,
+            timeout_sec=CAMERA_OUTPUT_READY_TIMEOUT_SEC,
+        )
         state["camera_status"] = "recording_confirmed"
-        state["camera_start_confirmed_utc"] = utc_iso_now()
+        state["camera_output_file_detected"] = output_ready["camera_output_file_detected"]
+        state["camera_output_growing_confirmed"] = output_ready["camera_output_growing_confirmed"]
+        state["camera_output_file"] = output_ready["camera_output_file"]
+        state["camera_output_initial_size_bytes"] = output_ready["initial_size_bytes"]
+        state["camera_output_confirmed_size_bytes"] = output_ready["confirmed_size_bytes"]
+        state["camera_readiness_reference"] = "pid_alive_and_output_size_increasing"
+        state["camera_output_growth_confirmed_utc"] = utc_iso_now()
+        state["camera_start_confirmed_utc"] = state["camera_output_growth_confirmed_utc"]
         state["camera_launch_timed_out"] = launch_timed_out
         save_state(state)
         append_event(
@@ -487,6 +698,11 @@ def start_camera(args):
                 "camera_host": camera_host,
                 "camera_pid": state.get("camera_pid"),
                 "camera_pid_confirmed": True,
+                "camera_process_confirmed": True,
+                "camera_output_file_detected": True,
+                "camera_output_growing_confirmed": True,
+                "camera_output_file": state.get("camera_output_file"),
+                "camera_readiness_reference": state["camera_readiness_reference"],
                 "camera_launch_timed_out": launch_timed_out,
                 "remote_pid_file": remote_pid_file,
                 "remote_log_file": remote_log,
@@ -495,6 +711,7 @@ def start_camera(args):
     except Exception as exc:
         tail = tail_remote_log(camera_host, remote_log, dry_run=args.dry_run)
         print("Camera startup failed. Remote log tail\n%s" % (tail or "<no log output>"), file=sys.stderr)
+        state["camera_start_failed"] = True
         state["camera_status"] = "start_failed"
         state["camera_start_failed_utc"] = utc_iso_now()
         state["camera_start_error"] = str(exc)
@@ -509,20 +726,21 @@ def start_camera(args):
             },
         )
         try:
-            stop_cmd = build_remote_camera_stop_command(remote_pid_file, args.remote_camera_stop)
-            run_ssh(
-                camera_host,
-                stop_cmd,
-                check=False,
-                dry_run=args.dry_run,
-                timeout=CAMERA_STOP_TIMEOUT_SEC,
-            )
-        except Exception:
-            pass
-        raise RuntimeError("Camera recording did not become ready.") from exc
+            state["camera_cleanup_after_start_failure_attempted"] = True
+            stop_camera(args, state)
+            state["camera_cleanup_after_start_failure_confirmed"] = True
+            save_state(state)
+        except Exception as cleanup_exc:
+            state["camera_cleanup_after_start_failure_confirmed"] = False
+            state["camera_cleanup_after_start_failure_error"] = str(cleanup_exc)
+            save_state(state)
+            raise RuntimeError(
+                "Camera recording did not become ready, and cleanup could not be confirmed: %s"
+                % cleanup_exc
+            ) from exc
+        raise RuntimeError("Camera recording did not become ready; cleanup was confirmed.") from exc
 
-    append_event(local_video_dir, "camera_start_returned", state)
-    print("Camera acquisition process confirmed running.")
+    print("Camera video output confirmed growing.")
     print("Camera host:      %s" % camera_host)
     print("Remote video dir: %s" % paths["remote_video_dir"])
     print("Local video dir:  %s" % local_video_dir)
@@ -540,6 +758,11 @@ def stop_camera(args, state=None):
     local_video_dir = Path(state.get("local_video_dir", LOCAL_VIDEO_ROOT / "unknown" / "video"))
     local_video_dir.mkdir(parents=True, exist_ok=True)
     remote_pid_file = state.get("remote_pid_file") or "%s/camera_acquisition.pid" % state.get("remote_video_dir", REMOTE_VIDEO_ROOT)
+    remote_video_dir = state.get("remote_video_dir") or REMOTE_VIDEO_ROOT
+    remote_base_path = state.get("remote_base_path") or remote_video_dir
+    remote_log_file = state.get("remote_log_file") or "%s/camera_acquisition.log" % remote_video_dir
+    expected_pid = state.get("camera_pid")
+    ignore_stop_errors = getattr(args, "ignore_stop_errors", False)
 
     append_event(local_video_dir, "camera_stop_requested", {"camera_host": camera_host, "remote_pid_file": remote_pid_file})
     state["camera_status"] = "stop_requested"
@@ -551,16 +774,74 @@ def stop_camera(args, state=None):
     run_ssh(
         camera_host,
         stop_cmd,
-        check=not args.ignore_stop_errors,
+        check=not ignore_stop_errors,
         dry_run=args.dry_run,
         timeout=CAMERA_STOP_TIMEOUT_SEC,
     )
 
-    state["camera_status"] = "stopped"
-    state["camera_stop_returned_utc"] = utc_iso_now()
+    state["camera_stop_command_returned"] = True
+    state["camera_stop_command_returned_utc"] = utc_iso_now()
+    state["camera_stop_returned_utc"] = state["camera_stop_command_returned_utc"]
     save_state(state)
-    append_event(local_video_dir, "camera_stop_returned", {"camera_host": camera_host, "remote_pid_file": remote_pid_file})
-    print("Camera stop command sent.")
+    append_event(
+        local_video_dir,
+        "camera_stop_command_returned",
+        {"camera_host": camera_host, "remote_pid_file": remote_pid_file},
+    )
+
+    try:
+        wait_for_remote_camera_stopped(
+            camera_host,
+            expected_pid,
+            remote_base_path,
+            remote_log_file,
+            dry_run=args.dry_run,
+            timeout_sec=CAMERA_STOP_VERIFY_TIMEOUT_SEC,
+        )
+    except Exception as exc:
+        state["camera_status"] = "stop_unverified"
+        state["camera_stop_confirmed"] = False
+        state["camera_stop_verification_error"] = str(exc)
+        save_state(state)
+        append_event(
+            local_video_dir,
+            "camera_stop_unverified",
+            {
+                "camera_host": camera_host,
+                "remote_pid_file": remote_pid_file,
+                "remote_base_path": remote_base_path,
+                "error": str(exc),
+            },
+        )
+        if ignore_stop_errors:
+            print(
+                "WARNING: Camera stop command returned, but stopped state was not verified.",
+                file=sys.stderr,
+            )
+            return state
+        raise
+
+    run_ssh(
+        camera_host,
+        "rm -f %s" % shlex.quote(remote_pid_file),
+        dry_run=args.dry_run,
+        timeout=CAMERA_STOP_TIMEOUT_SEC,
+    )
+    state["camera_status"] = "stopped_confirmed"
+    state["camera_stop_confirmed"] = True
+    state["camera_stop_confirmed_utc"] = utc_iso_now()
+    save_state(state)
+    append_event(
+        local_video_dir,
+        "camera_stop_confirmed",
+        {
+            "camera_host": camera_host,
+            "remote_pid_file": remote_pid_file,
+            "remote_base_path": remote_base_path,
+            "expected_pid": expected_pid,
+        },
+    )
+    print("Camera stop verified.")
     return state
 
 
@@ -722,6 +1003,7 @@ def build_parser():
         help="SSH host for camera Pi. Default: %s" % DEFAULT_CAMERA_HOST,
     )
     common.add_argument("--dry-run", action="store_true", help="Print commands without running them.")
+    common.add_argument("--json", action="store_true", help="Also print a machine-readable result line.")
 
     start = sub.add_parser("start", parents=[common], help="Start remote camera recording.")
     start.add_argument("--mouse-id", required=True, help="Mouse ID for session folder.")
@@ -754,9 +1036,9 @@ def build_parser():
             state = load_state()
         except RuntimeError:
             state = build_state_from_args(args)
-        stop_camera(args, state)
+        state = stop_camera(args, state)
         time.sleep(2.0)
-        fetch_camera(args, state)
+        return fetch_camera(args, state)
 
     stop_fetch.set_defaults(func=do_stop_fetch)
 
@@ -772,7 +1054,9 @@ def build_parser():
 def main():
     parser = build_parser()
     args = parser.parse_args()
-    args.func(args)
+    result = args.func(args)
+    if getattr(args, "json", False) and result is not None:
+        print(JSON_RESULT_PREFIX + json.dumps(result, sort_keys=True))
 
 
 if __name__ == "__main__":

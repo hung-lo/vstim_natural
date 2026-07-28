@@ -25,6 +25,8 @@ CAMERA_CONTROL_SCRIPT = PROJECT_ROOT / "remote_camera_control.py"
 DEFAULT_PRESTIM_BASELINE_MINUTES = 3.0
 BASELINE_INPUT_POLL_SEC = 0.25
 BASELINE_STATUS_INTERVAL_SEC = 10.0
+CAMERA_CONTROL_START_HARD_TIMEOUT_SEC = 60.0
+CAMERA_CONTROL_RESULT_PREFIX = "CAMERA_CONTROL_RESULT_JSON="
 
 
 def _log_completed_process(proc, label):
@@ -62,19 +64,141 @@ def run_camera_control(args, background=False, timeout=None):
     return result
 
 
+def parse_camera_control_result(result):
+    for line in reversed((result.stdout or "").splitlines()):
+        if line.startswith(CAMERA_CONTROL_RESULT_PREFIX):
+            return json.loads(line[len(CAMERA_CONTROL_RESULT_PREFIX):])
+    raise RuntimeError("Camera controller did not return a structured result.")
+
+
+def require_camera_state(result, field, operation):
+    state = parse_camera_control_result(result)
+    if not state.get(field):
+        raise RuntimeError("Camera %s was not confirmed by the controller." % operation)
+    return state
+
+
 def start_camera_recording(mouse_id, session_id):
     print("Starting remote camera recording...")
-    return run_camera_control(["start", "--mouse-id", mouse_id, "--session-id", session_id], background=False, timeout=20.0)
+    result = run_camera_control(
+        ["start", "--mouse-id", mouse_id, "--session-id", session_id, "--json"],
+        background=False,
+        timeout=CAMERA_CONTROL_START_HARD_TIMEOUT_SEC,
+    )
+    state = require_camera_state(result, "camera_output_growing_confirmed", "video output growth")
+    if not state.get("camera_pid_confirmed"):
+        raise RuntimeError("Camera process was not confirmed by the controller.")
+    return state
 
 
 def stop_camera_recording():
     print("Stopping remote camera recording...")
-    run_camera_control(["stop"])
+    result = run_camera_control(["stop", "--json"])
+    return require_camera_state(result, "camera_stop_confirmed", "stop")
 
 
 def fetch_camera_recording():
     print("Fetching camera files to box 151...")
     run_camera_control(["fetch"])
+
+
+def start_camera_recording_with_recovery(mouse_id, session_id, event_log_path):
+    try:
+        state = start_camera_recording(mouse_id, session_id)
+        return {
+            "confirmed_running": True,
+            "controller_state": state,
+            "cleanup_attempted": False,
+            "cleanup_confirmed": False,
+            "camera_state_unknown_acknowledged": False,
+            "error": "",
+        }
+    except (Exception, KeyboardInterrupt) as exc:
+        print("Camera start failed: %s" % exc, file=sys.stderr)
+        result = {
+            "confirmed_running": False,
+            "controller_state": {},
+            "cleanup_attempted": True,
+            "cleanup_confirmed": False,
+            "camera_state_unknown_acknowledged": False,
+            "error": str(exc),
+        }
+        base.append_csv_row(
+            event_log_path,
+            {
+                "event_type": "camera_start_failed",
+                "notes": "gray_active=true; error=%s" % exc,
+            },
+            base.EVENT_FIELDS,
+        )
+
+        while not result["cleanup_confirmed"] and not result["camera_state_unknown_acknowledged"]:
+            cleanup_error = None
+            try:
+                stop_state = stop_camera_recording()
+                result["cleanup_confirmed"] = True
+                result["controller_state"] = stop_state
+                base.append_csv_row(
+                    event_log_path,
+                    {
+                        "event_type": "camera_cleanup_after_start_failure_confirmed",
+                        "notes": "gray_active=true; camera_stop_confirmed=true",
+                    },
+                    base.EVENT_FIELDS,
+                )
+                break
+            except KeyboardInterrupt:
+                cleanup_error = KeyboardInterrupt("interrupted while verifying camera cleanup")
+            except Exception as exc_cleanup:
+                cleanup_error = exc_cleanup
+
+            print("Could not confirm camera cleanup after start failure: %s" % cleanup_error, file=sys.stderr)
+            base.append_csv_row(
+                event_log_path,
+                {
+                    "event_type": "camera_cleanup_after_start_failure_unverified",
+                    "notes": "gray_active=true; error=%s" % cleanup_error,
+                },
+                base.EVENT_FIELDS,
+            )
+
+            try:
+                retry_cleanup = base.prompt_yes_no(
+                    "Retry camera cleanup while keeping the screen gray",
+                    default_yes=True,
+                )
+            except KeyboardInterrupt:
+                print("Keyboard interrupt while choosing whether to retry camera cleanup.")
+                continue
+            if retry_cleanup:
+                continue
+
+            try:
+                acknowledge_unknown = base.prompt_yes_no(
+                    "Acknowledge that the camera may still be running and abort the experiment",
+                    default_yes=False,
+                )
+            except KeyboardInterrupt:
+                print("Keyboard interrupt while acknowledging the uncertain camera state.")
+                continue
+            if acknowledge_unknown:
+                result["camera_state_unknown_acknowledged"] = True
+                base.append_csv_row(
+                    event_log_path,
+                    {
+                        "event_type": "camera_state_unknown_acknowledged",
+                        "notes": "gray_active=true; experiment_aborted=true",
+                    },
+                    base.EVENT_FIELDS,
+                )
+                break
+
+            print(
+                "The camera must be confirmed stopped or explicitly acknowledged as uncertain. "
+                "The screen will remain gray."
+            )
+
+        return result
 
 
 
@@ -311,6 +435,28 @@ def run_poststim_black_baseline(screen, iti_raw, event_log_path, stimulus_playba
     poststim_camera_stop_confirmed_utc = ""
     poststim_black_ended_after_fetch = False
 
+    def defer_camera_fetch(reason, error=None):
+        nonlocal camera_fetch_completed
+        nonlocal camera_fetch_deferred
+
+        camera_fetch_completed = False
+        camera_fetch_deferred = True
+        notes = [
+            "poststim_black_active=true",
+            "left_on_camera_pi=true",
+            "reason=%s" % reason,
+        ]
+        if error is not None:
+            notes.append("error=%s" % error)
+        base.append_csv_row(
+            event_log_path,
+            {
+                "event_type": "camera_fetch_deferred",
+                "notes": "; ".join(notes),
+            },
+            base.EVENT_FIELDS,
+        )
+
     def record_stop_request(notes):
         nonlocal poststim_camera_stop_requested_utc
         if not poststim_camera_stop_requested_utc:
@@ -431,19 +577,8 @@ def run_poststim_black_baseline(screen, iti_raw, event_log_path, stimulus_playba
                 )
                 break
             except KeyboardInterrupt:
-                camera_fetch_completed = False
-                camera_fetch_deferred = True
-                base.append_csv_row(
-                    event_log_path,
-                    {
-                        "event_type": "camera_fetch_deferred",
-                        "notes": "poststim_black_active=true; left_on_camera_pi=true; reason=keyboard_interrupt",
-                    },
-                    base.EVENT_FIELDS,
-                )
-                print(
-                    "Camera is stopped. Fetch was interrupted; files remain on the camera Pi for later retrieval."
-                )
+                defer_camera_fetch(reason="keyboard_interrupt_during_fetch")
+                print("Camera is stopped. Fetch was interrupted; files remain on the camera Pi for later retrieval.")
                 break
             except Exception as exc:
                 camera_fetch_completed = False
@@ -456,18 +591,26 @@ def run_poststim_black_baseline(screen, iti_raw, event_log_path, stimulus_playba
                     },
                     base.EVENT_FIELDS,
                 )
-                if base.prompt_yes_no("Retry fetch while keeping the screen black", default_yes=True):
+                try:
+                    retry_fetch = base.prompt_yes_no(
+                        "Retry fetch while keeping the screen black",
+                        default_yes=True,
+                    )
+                except KeyboardInterrupt:
+                    print(
+                        "Fetch retry prompt interrupted. "
+                        "The camera is stopped and files remain on the camera Pi."
+                    )
+                    defer_camera_fetch(
+                        reason="keyboard_interrupt_at_retry_prompt",
+                        error=exc,
+                    )
+                    break
+
+                if retry_fetch:
                     continue
-                camera_fetch_deferred = True
-                base.append_csv_row(
-                    event_log_path,
-                    {
-                        "event_type": "camera_fetch_deferred",
-                        "notes": "poststim_black_active=true; left_on_camera_pi=true",
-                    },
-                    base.EVENT_FIELDS,
-                )
-                print("Leaving black baseline without fetched files.")
+                defer_camera_fetch(reason="user_declined_retry", error=exc)
+                print("Leaving black baseline with camera files available for later retrieval.")
                 break
 
     if not (camera_stop_confirmed or camera_left_running_by_user):
@@ -678,7 +821,7 @@ def main():
         "prestim_screen_open_before_camera": True,
         "prestim_raw_build_under_gray": True,
         "prestim_minimum_gray_sec": base.INITIAL_GRAY_SEC,
-        "prestim_baseline_clock_reference": "camera_pid_confirmed",
+        "prestim_baseline_clock_reference": "camera_output_growing_confirmed",
         "selected_images": selected_rows,
         "trials": trials,
         "camera_enabled": True,
@@ -697,6 +840,16 @@ def main():
     raw_cache_screen_compatibility_fallback = False
     camera_start_requested_utc = ""
     camera_start_returned_utc = ""
+    camera_start_command_returned = False
+    camera_process_confirmed = False
+    camera_output_file_detected = False
+    camera_output_growing_confirmed = False
+    camera_output_file = ""
+    camera_start_failed = False
+    camera_start_error = ""
+    camera_cleanup_after_start_failure_attempted = False
+    camera_cleanup_after_start_failure_confirmed = False
+    camera_state_unknown_acknowledged = False
     camera_start_confirmed_utc = ""
     prestim_gray_on_utc = ""
     prestim_gray_ready_utc = ""
@@ -757,17 +910,45 @@ def main():
                     },
                     base.EVENT_FIELDS,
                 )
-                start_camera_recording(mouse_id, session_id)
+                camera_start_result = start_camera_recording_with_recovery(
+                    mouse_id,
+                    session_id,
+                    event_log_path,
+                )
+                camera_controller_state = camera_start_result["controller_state"]
+                camera_start_command_returned = bool(
+                    camera_controller_state.get("camera_start_command_returned")
+                )
+                camera_process_confirmed = bool(camera_controller_state.get("camera_process_confirmed"))
+                camera_output_file_detected = bool(camera_controller_state.get("camera_output_file_detected"))
+                camera_output_growing_confirmed = bool(
+                    camera_controller_state.get("camera_output_growing_confirmed")
+                )
+                camera_output_file = camera_controller_state.get("camera_output_file") or ""
+                camera_start_failed = not camera_start_result["confirmed_running"]
+                camera_start_error = camera_start_result["error"]
+                camera_cleanup_after_start_failure_attempted = camera_start_result["cleanup_attempted"]
+                camera_cleanup_after_start_failure_confirmed = camera_start_result["cleanup_confirmed"]
+                camera_state_unknown_acknowledged = camera_start_result["camera_state_unknown_acknowledged"]
+                if not camera_start_result["confirmed_running"]:
+                    raise RuntimeError(
+                        "Experiment aborted because camera recording was not confirmed: %s"
+                        % camera_start_error
+                    )
+
                 camera_started = True
                 camera_start_returned_utc = base.utc_iso_now()
-                camera_start_confirmed_utc = camera_start_returned_utc
+                camera_start_confirmed_utc = (
+                    camera_controller_state.get("camera_output_growth_confirmed_utc")
+                    or camera_start_returned_utc
+                )
                 prestim_baseline_start_utc = camera_start_confirmed_utc
                 prestim_baseline_start_monotonic = time.monotonic()
                 base.append_csv_row(
                     event_log_path,
                     {
                         "event_type": "camera_recording_confirmed",
-                        "notes": "camera_pid_confirmed=true; gray_already_active=true",
+                        "notes": "camera_pid_confirmed=true; camera_output_growing_confirmed=true; gray_already_active=true",
                     },
                     base.EVENT_FIELDS,
                 )
@@ -775,7 +956,7 @@ def main():
                     event_log_path,
                     {
                         "event_type": "prestim_baseline_start",
-                        "notes": "requested_sec=%.3f; gray_already_active=true; camera_pid_confirmed=true" % prestim_baseline_sec,
+                        "notes": "requested_sec=%.3f; gray_already_active=true; camera_output_growing_confirmed=true" % prestim_baseline_sec,
                     },
                     base.EVENT_FIELDS,
                 )
@@ -971,6 +1152,18 @@ def main():
         metadata["camera_start_requested_utc"] = camera_start_requested_utc
         metadata["camera_start_returned_utc"] = camera_start_returned_utc
         metadata["camera_start_confirmed_utc"] = camera_start_confirmed_utc
+        metadata["camera_start_command_returned"] = camera_start_command_returned
+        metadata["camera_process_confirmed"] = camera_process_confirmed
+        metadata["camera_pid_confirmed"] = camera_process_confirmed
+        metadata["camera_output_file_detected"] = camera_output_file_detected
+        metadata["camera_output_growing_confirmed"] = camera_output_growing_confirmed
+        metadata["camera_output_file"] = camera_output_file
+        metadata["camera_readiness_reference"] = "pid_alive_and_output_size_increasing"
+        metadata["camera_start_failed"] = camera_start_failed
+        metadata["camera_start_error"] = camera_start_error
+        metadata["camera_cleanup_after_start_failure_attempted"] = camera_cleanup_after_start_failure_attempted
+        metadata["camera_cleanup_after_start_failure_confirmed"] = camera_cleanup_after_start_failure_confirmed
+        metadata["camera_state_unknown_acknowledged"] = camera_state_unknown_acknowledged
         metadata["session_completed"] = session_completed
         metadata["playback_started"] = playback_started
         metadata["poststim_baseline_mode"] = "gray_transition_then_black_open_ended"
@@ -993,7 +1186,7 @@ def main():
         metadata["prestim_screen_open_before_camera"] = True
         metadata["prestim_raw_build_under_gray"] = raw_cache_built_with_screen_open
         metadata["prestim_minimum_gray_sec"] = base.INITIAL_GRAY_SEC
-        metadata["prestim_baseline_clock_reference"] = "camera_pid_confirmed"
+        metadata["prestim_baseline_clock_reference"] = "camera_output_growing_confirmed"
         metadata["prestim_gray_on_utc"] = prestim_gray_on_utc
         metadata["prestim_gray_ready_utc"] = prestim_gray_ready_utc
         metadata["prestim_gray_before_camera_start_sec"] = (
