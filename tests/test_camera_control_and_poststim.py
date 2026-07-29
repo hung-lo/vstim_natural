@@ -1,6 +1,7 @@
 import argparse
 import subprocess
 import sys
+import tempfile
 import types
 import unittest
 from pathlib import Path
@@ -61,6 +62,81 @@ class CameraControlAndPoststimTests(unittest.TestCase):
                 rc.run_cmd(["ssh", "pi@host", "echo hi"], timeout=3.0)
 
         self.assertIn("timed out", str(ctx.exception).lower())
+
+    def test_run_rsync_uses_partial_timeout_and_preserves_sources(self):
+        captured = {}
+
+        def fake_run_cmd(cmd, check=True, dry_run=False, timeout=None):
+            captured["cmd"] = cmd
+            captured["timeout"] = timeout
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+        with patch.object(rc, "run_cmd", side_effect=fake_run_cmd):
+            rc.run_rsync("pi@host", "/remote/session/video", Path("/tmp/local-video"), timeout_sec=123.0)
+
+        self.assertIn("--partial", captured["cmd"])
+        self.assertIn("--timeout=30", captured["cmd"])
+        self.assertIn("--remove-source-files", captured["cmd"])
+        self.assertEqual(captured["timeout"], 123.0)
+
+    def test_convert_timeout_removes_incomplete_mp4_and_keeps_h264(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            h264_path = tmp_path / "session.h264"
+            mp4_path = tmp_path / "session.mp4"
+            h264_path.write_bytes(b"raw")
+
+            def fake_run(cmd, check=True, text=True, capture_output=True, timeout=None):
+                mp4_path.write_bytes(b"partial")
+                raise subprocess.TimeoutExpired(cmd=["ffmpeg"], timeout=timeout)
+
+            with patch.object(rc.shutil, "which", return_value="/usr/bin/ffmpeg"), patch.object(
+                rc.subprocess,
+                "run",
+                side_effect=fake_run,
+            ):
+                with self.assertRaises(RuntimeError) as ctx:
+                    rc.convert_h264_to_mp4(tmp_path, dry_run=False, timeout_sec=1.0)
+
+            self.assertIn("timed out", str(ctx.exception).lower())
+            self.assertTrue(h264_path.exists())
+            self.assertFalse(mp4_path.exists())
+
+    def test_fetch_timeout_logs_rsync_failure_without_fetch_return(self):
+        events = []
+        args = argparse.Namespace(dry_run=False, rsync_timeout_sec=1.0, ffmpeg_timeout_sec=1.0)
+        state = {
+            "camera_host": "pi@host",
+            "remote_video_dir": "/remote/session/video",
+            "local_video_dir": "/tmp/session/video",
+            "framerate": 30,
+        }
+
+        def fake_append_event(local_video_dir, event, details=None):
+            events.append((event, details or {}))
+
+        with patch.object(rc, "run_rsync", side_effect=RuntimeError("Command timed out after 1.0 seconds")), patch.object(
+            rc, "append_event", side_effect=fake_append_event
+        ), patch("builtins.print"):
+            with self.assertRaises(RuntimeError):
+                rc.fetch_camera(args, state)
+
+        event_names = [event for event, _ in events]
+        self.assertIn("camera_fetch_requested", event_names)
+        self.assertIn("camera_fetch_failed", event_names)
+        self.assertNotIn("camera_fetch_returned", event_names)
+        self.assertEqual(events[-1][1]["stage"], "rsync")
+
+    def test_fetch_rejects_nonpositive_timeout_values(self):
+        args = argparse.Namespace(dry_run=False, rsync_timeout_sec=0, ffmpeg_timeout_sec=1.0)
+        state = {
+            "camera_host": "pi@host",
+            "remote_video_dir": "/remote/session/video",
+            "local_video_dir": "/tmp/session/video",
+            "framerate": 30,
+        }
+        with self.assertRaises(ValueError):
+            rc.fetch_camera(args, state)
 
     def test_build_remote_launch_command_contains_detach_and_pid_file(self):
         paths = {
@@ -213,6 +289,7 @@ class CameraControlAndPoststimTests(unittest.TestCase):
 
         def fake_fetch_camera_recording():
             fetch_calls.append("fetch")
+            return {"camera_fetch_completed": True, "camera_conversion_completed": True, "camera_conversion_deferred": False}
 
         with patch.object(base, "append_csv_row", side_effect=fake_append_csv_row), patch.object(base, "prompt_yes_no", side_effect=prompt_results), patch.object(
             cam, "stop_camera_recording", side_effect=fake_stop_camera_recording
@@ -233,6 +310,7 @@ class CameraControlAndPoststimTests(unittest.TestCase):
             "camera_stop_confirmed",
             "camera_fetch_started",
             "camera_fetch_completed",
+            "camera_conversion_completed",
             "poststim_black_end",
             "session_end",
         ])
@@ -260,6 +338,7 @@ class CameraControlAndPoststimTests(unittest.TestCase):
 
         def fake_fetch_camera_recording():
             fetch_calls.append("fetch")
+            return {"camera_fetch_completed": True, "camera_conversion_completed": True, "camera_conversion_deferred": False}
 
         with patch.object(base, "append_csv_row", side_effect=fake_append_csv_row), patch.object(base, "prompt_yes_no", side_effect=prompt_results), patch.object(
             cam, "stop_camera_recording", side_effect=fake_stop_camera_recording
@@ -273,6 +352,7 @@ class CameraControlAndPoststimTests(unittest.TestCase):
         self.assertTrue(result["camera_stop_confirmed"])
         self.assertFalse(result["camera_left_running_by_user"])
         self.assertTrue(result["camera_fetch_completed"])
+        self.assertTrue(result["camera_conversion_completed"])
         self.assertFalse(result["camera_fetch_deferred"])
 
     def test_declining_retry_and_leave_running_keeps_prompting_until_stop_succeeds(self):
@@ -293,6 +373,7 @@ class CameraControlAndPoststimTests(unittest.TestCase):
 
         def fake_fetch_camera_recording():
             fetch_calls.append("fetch")
+            return {"camera_fetch_completed": True, "camera_conversion_completed": True, "camera_conversion_deferred": False}
 
         with patch.object(base, "append_csv_row", side_effect=fake_append_csv_row), patch.object(base, "prompt_yes_no", side_effect=prompt_results), patch.object(
             cam, "stop_camera_recording", side_effect=fake_stop_camera_recording
@@ -306,6 +387,7 @@ class CameraControlAndPoststimTests(unittest.TestCase):
         self.assertTrue(result["camera_stop_confirmed"])
         self.assertFalse(result["camera_left_running_by_user"])
         self.assertTrue(result["camera_fetch_completed"])
+        self.assertTrue(result["camera_conversion_completed"])
         self.assertFalse(result["camera_fetch_deferred"])
 
     def test_keyboard_interrupt_during_fetch_marks_fetch_deferred(self):
@@ -356,6 +438,7 @@ class CameraControlAndPoststimTests(unittest.TestCase):
             fetch_calls.append("fetch")
             if len(fetch_calls) == 1:
                 raise RuntimeError("fetch failed")
+            return {"camera_fetch_completed": True, "camera_conversion_completed": True, "camera_conversion_deferred": False}
 
         with patch.object(base, "append_csv_row", side_effect=fake_append_csv_row), patch.object(base, "prompt_yes_no", side_effect=prompt_results), patch.object(
             cam, "stop_camera_recording", side_effect=fake_stop_camera_recording
@@ -368,8 +451,9 @@ class CameraControlAndPoststimTests(unittest.TestCase):
         self.assertEqual(fetch_calls, ["fetch", "fetch"])
         self.assertEqual(event_types.count("camera_fetch_started"), 2)
         self.assertIn("camera_fetch_failed", event_types)
-        self.assertFalse(result["camera_fetch_deferred"])
         self.assertTrue(result["camera_fetch_completed"])
+        self.assertTrue(result["camera_conversion_completed"])
+        self.assertFalse(result["camera_fetch_deferred"])
 
 
 
@@ -424,7 +508,7 @@ class CameraControlAndPoststimTests(unittest.TestCase):
         with patch.object(cam, "run_camera_control", side_effect=fake_run_camera_control), patch("builtins.print"):
             result = cam.start_camera_recording("mouse", "session")
 
-        self.assertGreaterEqual(captured["timeout"], 60.0)
+        self.assertGreaterEqual(captured["timeout"], 90.0)
         self.assertIn("--json", captured["args"])
         self.assertEqual(result["camera_output_file"], "/remote/session.h264")
 

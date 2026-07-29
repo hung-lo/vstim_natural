@@ -25,7 +25,12 @@ CAMERA_CONTROL_SCRIPT = PROJECT_ROOT / "remote_camera_control.py"
 DEFAULT_PRESTIM_BASELINE_MINUTES = 3.0
 BASELINE_INPUT_POLL_SEC = 0.25
 BASELINE_STATUS_INTERVAL_SEC = 10.0
-CAMERA_CONTROL_START_HARD_TIMEOUT_SEC = 60.0
+CAMERA_CONTROL_START_HARD_TIMEOUT_SEC = 90.0
+# Emergency wrapper timeout only; the controller owns the normal launch,
+# readiness, diagnostics, and verified-cleanup timeouts. Keep this longer
+# than their combined worst-case path so the wrapper does not interrupt
+# camera cleanup.
+CAMERA_CONTROL_FETCH_HARD_TIMEOUT_SEC = 600.0
 CAMERA_CONTROL_RESULT_PREFIX = "CAMERA_CONTROL_RESULT_JSON="
 
 
@@ -50,6 +55,15 @@ def run_camera_control(args, background=False, timeout=None):
 
     try:
         result = subprocess.run(cmd, check=True, text=True, capture_output=True, timeout=timeout)
+    except subprocess.TimeoutExpired as exc:
+        if exc.stdout:
+            print(exc.stdout, end="")
+        if exc.stderr:
+            print(exc.stderr, end="", file=sys.stderr)
+        timeout_desc = "unknown" if timeout is None else "%.1f" % timeout
+        raise RuntimeError(
+            "Camera controller exceeded the %s-second emergency timeout." % timeout_desc
+        ) from exc
     except subprocess.CalledProcessError as exc:
         if exc.stdout:
             print(exc.stdout, end="")
@@ -99,7 +113,14 @@ def stop_camera_recording():
 
 def fetch_camera_recording():
     print("Fetching camera files to box 151...")
-    run_camera_control(["fetch"])
+    result = run_camera_control(["fetch", "--json"], timeout=CAMERA_CONTROL_FETCH_HARD_TIMEOUT_SEC)
+    return parse_camera_control_result(result)
+
+
+def convert_camera_recording():
+    print("Converting fetched camera files to MP4...")
+    result = run_camera_control(["convert", "--json"], timeout=CAMERA_CONTROL_FETCH_HARD_TIMEOUT_SEC)
+    return parse_camera_control_result(result)
 
 
 def start_camera_recording_with_recovery(mouse_id, session_id, event_log_path):
@@ -430,6 +451,9 @@ def run_poststim_black_baseline(screen, iti_raw, event_log_path, stimulus_playba
     camera_left_running_by_user = False
     camera_fetch_started = False
     camera_fetch_completed = False
+    camera_conversion_started = False
+    camera_conversion_completed = False
+    camera_conversion_deferred = False
     camera_fetch_deferred = False
     poststim_camera_stop_requested_utc = ""
     poststim_camera_stop_confirmed_utc = ""
@@ -452,6 +476,28 @@ def run_poststim_black_baseline(screen, iti_raw, event_log_path, stimulus_playba
             event_log_path,
             {
                 "event_type": "camera_fetch_deferred",
+                "notes": "; ".join(notes),
+            },
+            base.EVENT_FIELDS,
+        )
+
+    def defer_camera_conversion(reason, error=None):
+        nonlocal camera_conversion_completed
+        nonlocal camera_conversion_deferred
+
+        camera_conversion_completed = False
+        camera_conversion_deferred = True
+        notes = [
+            "poststim_black_active=true",
+            "raw_h264_available_locally=true",
+            "reason=%s" % reason,
+        ]
+        if error is not None:
+            notes.append("error=%s" % error)
+        base.append_csv_row(
+            event_log_path,
+            {
+                "event_type": "camera_conversion_deferred",
                 "notes": "; ".join(notes),
             },
             base.EVENT_FIELDS,
@@ -564,18 +610,132 @@ def run_poststim_black_baseline(screen, iti_raw, event_log_path, stimulus_playba
             )
             try:
                 time.sleep(2.0)
-                fetch_camera_recording()
-                camera_fetch_completed = True
-                poststim_black_ended_after_fetch = True
+                fetch_result = fetch_camera_recording()
+                camera_fetch_completed = bool(fetch_result.get("camera_fetch_completed"))
+                camera_conversion_started = True
+                camera_conversion_completed = bool(fetch_result.get("camera_conversion_completed"))
+                camera_conversion_deferred = bool(fetch_result.get("camera_conversion_deferred"))
+                if not camera_fetch_completed:
+                    raise RuntimeError(fetch_result.get("camera_fetch_error") or "Camera fetch did not complete.")
                 base.append_csv_row(
                     event_log_path,
                     {
                         "event_type": "camera_fetch_completed",
-                        "notes": "poststim_black_active=true",
+                        "notes": "poststim_black_active=true; camera_conversion_completed=%s"
+                        % camera_conversion_completed,
                     },
                     base.EVENT_FIELDS,
                 )
-                break
+                if camera_conversion_completed:
+                    poststim_black_ended_after_fetch = True
+                    base.append_csv_row(
+                        event_log_path,
+                        {
+                            "event_type": "camera_conversion_completed",
+                            "notes": "poststim_black_active=true; raw_h264_available_locally=true",
+                        },
+                        base.EVENT_FIELDS,
+                    )
+                    break
+
+                camera_conversion_error = fetch_result.get("camera_conversion_error") or "MP4 conversion did not complete."
+                print(
+                    "Camera files were transferred, but MP4 conversion did not complete. Raw .h264 files are available on box 151.",
+                    file=sys.stderr,
+                )
+                base.append_csv_row(
+                    event_log_path,
+                    {
+                        "event_type": "camera_conversion_failed",
+                        "notes": "poststim_black_active=true; error=%s" % camera_conversion_error,
+                    },
+                    base.EVENT_FIELDS,
+                )
+
+                while True:
+                    try:
+                        retry_conversion = base.prompt_yes_no(
+                            "Retry MP4 conversion while keeping the screen black",
+                            default_yes=True,
+                        )
+                    except KeyboardInterrupt:
+                        defer_camera_conversion(
+                            reason="keyboard_interrupt_at_conversion_retry_prompt",
+                            error=camera_conversion_error,
+                        )
+                        print("MP4 conversion was interrupted; raw files remain on box 151 for later conversion.")
+                        break
+
+                    if not retry_conversion:
+                        defer_camera_conversion(reason="user_declined_conversion_retry", error=camera_conversion_error)
+                        print("Leaving black baseline with raw H.264 available on box 151.")
+                        break
+
+                    try:
+                        time.sleep(2.0)
+                        convert_result = convert_camera_recording()
+                        camera_conversion_completed = bool(convert_result.get("camera_conversion_completed"))
+                        camera_conversion_deferred = bool(convert_result.get("camera_conversion_deferred"))
+                        if camera_conversion_completed:
+                            poststim_black_ended_after_fetch = True
+                            base.append_csv_row(
+                                event_log_path,
+                                {
+                                    "event_type": "camera_conversion_completed",
+                                    "notes": "poststim_black_active=true; raw_h264_available_locally=true",
+                                },
+                                base.EVENT_FIELDS,
+                            )
+                            break
+
+                        camera_conversion_error = convert_result.get("camera_conversion_error") or "MP4 conversion did not complete."
+                        print("ERROR converting camera files: %s" % camera_conversion_error, file=sys.stderr)
+                        base.append_csv_row(
+                            event_log_path,
+                            {
+                                "event_type": "camera_conversion_failed",
+                                "notes": "poststim_black_active=true; error=%s" % camera_conversion_error,
+                            },
+                            base.EVENT_FIELDS,
+                        )
+                    except KeyboardInterrupt:
+                        defer_camera_conversion(
+                            reason="keyboard_interrupt_during_conversion",
+                            error=camera_conversion_error,
+                        )
+                        break
+                    except Exception as exc:
+                        camera_conversion_error = exc
+                        print("ERROR converting camera: %s" % exc, file=sys.stderr)
+                        base.append_csv_row(
+                            event_log_path,
+                            {
+                                "event_type": "camera_conversion_failed",
+                                "notes": "poststim_black_active=true; error=%s" % exc,
+                            },
+                            base.EVENT_FIELDS,
+                        )
+                        try:
+                            retry_conversion = base.prompt_yes_no(
+                                "Retry MP4 conversion while keeping the screen black",
+                                default_yes=True,
+                            )
+                        except KeyboardInterrupt:
+                            defer_camera_conversion(
+                                reason="keyboard_interrupt_at_conversion_retry_prompt",
+                                error=exc,
+                            )
+                            break
+                        if retry_conversion:
+                            continue
+                        defer_camera_conversion(reason="user_declined_conversion_retry", error=exc)
+                        print("Leaving black baseline with raw H.264 available on box 151.")
+                        break
+
+                if camera_conversion_completed or camera_conversion_deferred:
+                    break
+
+                continue
             except KeyboardInterrupt:
                 defer_camera_fetch(reason="keyboard_interrupt_during_fetch")
                 print("Camera is stopped. Fetch was interrupted; files remain on the camera Pi for later retrieval.")
@@ -636,13 +796,15 @@ def run_poststim_black_baseline(screen, iti_raw, event_log_path, stimulus_playba
         event_log_path,
         {
             "event_type": "session_end",
-            "notes": "stimulus_playback_completed=%s; camera_stop_confirmed=%s; camera_left_running_by_user=%s; camera_fetch_completed=%s; camera_fetch_deferred=%s"
+            "notes": "stimulus_playback_completed=%s; camera_stop_confirmed=%s; camera_left_running_by_user=%s; camera_fetch_completed=%s; camera_conversion_completed=%s; camera_fetch_deferred=%s; camera_conversion_deferred=%s"
             % (
                 stimulus_playback_completed,
                 camera_stop_confirmed,
                 camera_left_running_by_user,
                 camera_fetch_completed,
+                camera_conversion_completed,
                 camera_fetch_deferred,
+                camera_conversion_deferred,
             ),
         },
         base.EVENT_FIELDS,
@@ -664,6 +826,9 @@ def run_poststim_black_baseline(screen, iti_raw, event_log_path, stimulus_playba
         "camera_left_running_by_user": camera_left_running_by_user,
         "camera_fetch_started": camera_fetch_started,
         "camera_fetch_completed": camera_fetch_completed,
+        "camera_conversion_started": camera_conversion_started,
+        "camera_conversion_completed": camera_conversion_completed,
+        "camera_conversion_deferred": camera_conversion_deferred,
         "camera_fetch_deferred": camera_fetch_deferred,
         "session_completed": session_completed,
         "poststim_screen_remained_open": True,
@@ -1145,6 +1310,9 @@ def main():
         metadata["camera_started"] = camera_started
         metadata["camera_stopped"] = camera_stopped
         metadata["camera_fetch_completed"] = camera_fetch_completed
+        metadata["camera_conversion_started"] = poststim_result["camera_conversion_started"] if poststim_result else False
+        metadata["camera_conversion_completed"] = poststim_result["camera_conversion_completed"] if poststim_result else False
+        metadata["camera_conversion_deferred"] = poststim_result["camera_conversion_deferred"] if poststim_result else False
         metadata["camera_fetch_deferred"] = poststim_result["camera_fetch_deferred"] if poststim_result else False
         metadata["camera_left_running_by_user"] = poststim_result["camera_left_running_by_user"] if poststim_result else False
         metadata["camera_fetch_started"] = poststim_result["camera_fetch_started"] if poststim_result else False

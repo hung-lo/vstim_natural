@@ -62,6 +62,8 @@ CAMERA_OUTPUT_READY_TIMEOUT_SEC = 12.0
 CAMERA_OUTPUT_READY_POLL_SEC = 0.5
 CAMERA_OUTPUT_MIN_BYTES = 1
 CAMERA_OUTPUT_GLOB = "*.h264"
+CAMERA_RSYNC_TIMEOUT_SEC = 300.0
+CAMERA_FFMPEG_TIMEOUT_SEC = 120.0
 CAMERA_STOP_TIMEOUT_SEC = 10.0
 CAMERA_PREVIEW_LAUNCH_TIMEOUT_SEC = 10.0
 CAMERA_STOP_VERIFY_TIMEOUT_SEC = 8.0
@@ -378,23 +380,26 @@ def wait_for_remote_camera_stopped(
     )
 
 
-def run_rsync(camera_host, remote_dir, local_dir, dry_run=False):
+def run_rsync(camera_host, remote_dir, local_dir, dry_run=False, timeout_sec=CAMERA_RSYNC_TIMEOUT_SEC):
     local_dir.mkdir(parents=True, exist_ok=True)
     return run_cmd(
         [
             "rsync",
             "-av",
             "--progress",
+            "--partial",
+            "--timeout=30",
             "--remove-source-files",
             f"{camera_host}:{remote_dir.rstrip('/')}/",
             str(local_dir) + "/",
         ],
         check=True,
         dry_run=dry_run,
+        timeout=timeout_sec,
     )
 
 
-def convert_h264_to_mp4(local_video_dir, framerate=CAMERA_FRAMERATE, dry_run=False):
+def convert_h264_to_mp4(local_video_dir, framerate=CAMERA_FRAMERATE, dry_run=False, timeout_sec=CAMERA_FFMPEG_TIMEOUT_SEC):
     ffmpeg = shutil.which("ffmpeg")
     if ffmpeg is None:
         print("ffmpeg not found; skipping mp4 conversion.")
@@ -428,7 +433,15 @@ def convert_h264_to_mp4(local_video_dir, framerate=CAMERA_FRAMERATE, dry_run=Fal
         if dry_run:
             continue
         try:
-            subprocess.run(cmd, check=True, text=True, capture_output=True)
+            subprocess.run(cmd, check=True, text=True, capture_output=True, timeout=timeout_sec)
+        except subprocess.TimeoutExpired as exc:
+            if output_path.exists():
+                output_path.unlink()
+            if exc.stdout:
+                print(exc.stdout, end="")
+            if exc.stderr:
+                print(exc.stderr, end="", file=sys.stderr)
+            raise RuntimeError("MP4 conversion timed out after %.1f seconds for %s" % (timeout_sec, input_path.name)) from exc
         except subprocess.CalledProcessError as exc:
             if exc.stdout:
                 print(exc.stdout, end="")
@@ -888,6 +901,72 @@ def preview_camera(args):
         print("Dry run finished; preview was not actually started.")
 
 
+def convert_camera(args, state=None):
+    if getattr(args, "ffmpeg_timeout_sec", CAMERA_FFMPEG_TIMEOUT_SEC) <= 0:
+        raise ValueError("--ffmpeg-timeout-sec must be greater than 0")
+
+    if state is None:
+        try:
+            state = load_state()
+        except RuntimeError:
+            state = build_state_from_args(args)
+
+    camera_host = resolve_camera_host(args, state)
+    local_video_dir = Path(state["local_video_dir"])
+    local_video_dir.mkdir(parents=True, exist_ok=True)
+
+    append_event(
+        local_video_dir,
+        "camera_conversion_requested",
+        {
+            "camera_host": camera_host,
+            "local_video_dir": str(local_video_dir),
+            "ffmpeg_timeout_sec": getattr(args, "ffmpeg_timeout_sec", CAMERA_FFMPEG_TIMEOUT_SEC),
+        },
+    )
+
+    try:
+        convert_h264_to_mp4(
+            local_video_dir,
+            framerate=state.get("framerate", CAMERA_FRAMERATE),
+            dry_run=args.dry_run,
+            timeout_sec=getattr(args, "ffmpeg_timeout_sec", CAMERA_FFMPEG_TIMEOUT_SEC),
+        )
+    except Exception as exc:
+        state["camera_conversion_failed"] = True
+        state["camera_conversion_failed_utc"] = utc_iso_now()
+        state["camera_conversion_error"] = str(exc)
+        state["camera_conversion_completed"] = False
+        state["camera_conversion_deferred"] = False
+        append_event(
+            local_video_dir,
+            "camera_conversion_failed",
+            {
+                "camera_host": camera_host,
+                "local_video_dir": str(local_video_dir),
+                "ffmpeg_timeout_sec": getattr(args, "ffmpeg_timeout_sec", CAMERA_FFMPEG_TIMEOUT_SEC),
+                "error": str(exc),
+            },
+        )
+        print("MP4 conversion did not complete.", file=sys.stderr)
+        return state
+
+    state["camera_conversion_completed"] = True
+    state["camera_conversion_completed_utc"] = utc_iso_now()
+    state["camera_conversion_deferred"] = False
+    state["raw_h264_available_locally"] = True
+    append_event(
+        local_video_dir,
+        "camera_conversion_completed",
+        {
+            "camera_host": camera_host,
+            "local_video_dir": str(local_video_dir),
+        },
+    )
+    print("Converted camera files in: %s" % local_video_dir)
+    return state
+
+
 def status_camera(args):
     state = load_state() if STATE_FILE.exists() else None
     camera_host = resolve_camera_host(args, state)
@@ -919,6 +998,11 @@ def status_camera(args):
 
 
 def fetch_camera(args, state=None):
+    if getattr(args, "rsync_timeout_sec", CAMERA_RSYNC_TIMEOUT_SEC) <= 0:
+        raise ValueError("--rsync-timeout-sec must be greater than 0")
+    if getattr(args, "ffmpeg_timeout_sec", CAMERA_FFMPEG_TIMEOUT_SEC) <= 0:
+        raise ValueError("--ffmpeg-timeout-sec must be greater than 0")
+
     if state is None:
         try:
             state = load_state()
@@ -929,6 +1013,11 @@ def fetch_camera(args, state=None):
     remote_video_dir = state["remote_video_dir"]
     local_video_dir = Path(state["local_video_dir"])
     local_video_dir.mkdir(parents=True, exist_ok=True)
+    state["camera_fetch_completed"] = False
+    state["camera_conversion_completed"] = False
+    state["camera_conversion_deferred"] = False
+    state["camera_fetch_timed_out"] = False
+    state["raw_h264_available_locally"] = False
 
     append_event(
         local_video_dir,
@@ -937,11 +1026,41 @@ def fetch_camera(args, state=None):
             "camera_host": camera_host,
             "remote_video_dir": remote_video_dir,
             "local_video_dir": str(local_video_dir),
+            "rsync_timeout_sec": getattr(args, "rsync_timeout_sec", CAMERA_RSYNC_TIMEOUT_SEC),
+            "ffmpeg_timeout_sec": getattr(args, "ffmpeg_timeout_sec", CAMERA_FFMPEG_TIMEOUT_SEC),
         },
     )
 
-    run_rsync(camera_host, remote_video_dir, local_video_dir, dry_run=args.dry_run)
+    try:
+        run_rsync(
+            camera_host,
+            remote_video_dir,
+            local_video_dir,
+            dry_run=args.dry_run,
+            timeout_sec=getattr(args, "rsync_timeout_sec", CAMERA_RSYNC_TIMEOUT_SEC),
+        )
+    except Exception as exc:
+        state["camera_fetch_failed"] = True
+        state["camera_fetch_failed_utc"] = utc_iso_now()
+        state["camera_fetch_error"] = str(exc)
+        if "timed out" in str(exc).lower():
+            state["camera_fetch_timed_out"] = True
+        append_event(
+            local_video_dir,
+            "camera_fetch_failed",
+            {
+                "camera_host": camera_host,
+                "remote_video_dir": remote_video_dir,
+                "local_video_dir": str(local_video_dir),
+                "stage": "rsync",
+                "timeout_sec": getattr(args, "rsync_timeout_sec", CAMERA_RSYNC_TIMEOUT_SEC),
+                "error": str(exc),
+            },
+        )
+        raise
 
+    state["camera_fetch_completed"] = True
+    state["camera_fetch_returned_utc"] = utc_iso_now()
     append_event(
         local_video_dir,
         "camera_fetch_returned",
@@ -958,12 +1077,42 @@ def fetch_camera(args, state=None):
         {
             "camera_host": camera_host,
             "local_video_dir": str(local_video_dir),
+            "ffmpeg_timeout_sec": getattr(args, "ffmpeg_timeout_sec", CAMERA_FFMPEG_TIMEOUT_SEC),
         },
     )
-    convert_h264_to_mp4(local_video_dir, framerate=state.get("framerate", CAMERA_FRAMERATE), dry_run=args.dry_run)
+    try:
+        convert_h264_to_mp4(
+            local_video_dir,
+            framerate=state.get("framerate", CAMERA_FRAMERATE),
+            dry_run=args.dry_run,
+            timeout_sec=getattr(args, "ffmpeg_timeout_sec", CAMERA_FFMPEG_TIMEOUT_SEC),
+        )
+    except Exception as exc:
+        state["camera_conversion_failed"] = True
+        state["camera_conversion_failed_utc"] = utc_iso_now()
+        state["camera_conversion_error"] = str(exc)
+        state["camera_conversion_completed"] = False
+        state["raw_h264_available_locally"] = True
+        append_event(
+            local_video_dir,
+            "camera_conversion_failed",
+            {
+                "camera_host": camera_host,
+                "local_video_dir": str(local_video_dir),
+                "ffmpeg_timeout_sec": getattr(args, "ffmpeg_timeout_sec", CAMERA_FFMPEG_TIMEOUT_SEC),
+                "error": str(exc),
+            },
+        )
+        print("Camera files were transferred, but MP4 conversion did not complete.", file=sys.stderr)
+        print("Raw .h264 files are available locally at: %s" % local_video_dir, file=sys.stderr)
+        return state
+
+    state["camera_conversion_completed"] = True
+    state["camera_conversion_completed_utc"] = utc_iso_now()
+    state["raw_h264_available_locally"] = True
     append_event(
         local_video_dir,
-        "camera_conversion_returned",
+        "camera_conversion_completed",
         {
             "camera_host": camera_host,
             "local_video_dir": str(local_video_dir),
@@ -1020,7 +1169,13 @@ def build_parser():
     stop.set_defaults(func=stop_camera)
 
     fetch = sub.add_parser("fetch", parents=[common], help="Fetch last remote camera files with rsync.")
+    fetch.add_argument("--rsync-timeout-sec", type=float, default=CAMERA_RSYNC_TIMEOUT_SEC)
+    fetch.add_argument("--ffmpeg-timeout-sec", type=float, default=CAMERA_FFMPEG_TIMEOUT_SEC)
     fetch.set_defaults(func=fetch_camera)
+
+    convert = sub.add_parser("convert", parents=[common], help="Convert locally fetched .h264 files to MP4.")
+    convert.add_argument("--ffmpeg-timeout-sec", type=float, default=CAMERA_FFMPEG_TIMEOUT_SEC)
+    convert.set_defaults(func=convert_camera)
 
     preview = sub.add_parser("preview", parents=[common], help="Start a live camera preview, then stop it when you type y.")
     preview.set_defaults(func=preview_camera)
@@ -1030,6 +1185,8 @@ def build_parser():
     stop_fetch.add_argument("--session-id", default=None, help="Session ID if no saved session state exists yet.")
     stop_fetch.add_argument("--remote-camera-stop", default=REMOTE_CAMERA_STOP)
     stop_fetch.add_argument("--ignore-stop-errors", action="store_true", default=False)
+    stop_fetch.add_argument("--rsync-timeout-sec", type=float, default=CAMERA_RSYNC_TIMEOUT_SEC)
+    stop_fetch.add_argument("--ffmpeg-timeout-sec", type=float, default=CAMERA_FFMPEG_TIMEOUT_SEC)
 
     def do_stop_fetch(args):
         try:
