@@ -62,6 +62,7 @@ CAMERA_OUTPUT_READY_TIMEOUT_SEC = 12.0
 CAMERA_OUTPUT_READY_POLL_SEC = 0.5
 CAMERA_OUTPUT_MIN_BYTES = 1
 CAMERA_OUTPUT_GLOB = "*.h264"
+CAMERA_RAW_VIDEO_PATTERNS = ("*.h264",)
 CAMERA_RSYNC_TIMEOUT_SEC = 300.0
 CAMERA_FFMPEG_TIMEOUT_SEC = 120.0
 CAMERA_STOP_TIMEOUT_SEC = 10.0
@@ -102,6 +103,31 @@ def sanitize_id(text):
     return "".join(keep)
 
 
+def subprocess_output_to_text(value):
+    if value is None:
+        return ""
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    return str(value)
+
+
+def tail_text(text, max_chars=4000):
+    text = text or ""
+    if len(text) <= max_chars:
+        return text
+    return "...[truncated]...\n" + text[-max_chars:]
+
+
+def print_subprocess_output(stdout, stderr):
+    stdout_text = subprocess_output_to_text(stdout)
+    stderr_text = subprocess_output_to_text(stderr)
+    if stdout_text:
+        print(stdout_text, end="" if stdout_text.endswith("\n") else "\n")
+    if stderr_text:
+        print(stderr_text, end="" if stderr_text.endswith("\n") else "\n", file=sys.stderr)
+    return stdout_text, stderr_text
+
+
 def run_cmd(cmd, check=True, dry_run=False, timeout=None):
     print("+ " + " ".join(shlex.quote(x) for x in cmd))
     if dry_run:
@@ -109,17 +135,19 @@ def run_cmd(cmd, check=True, dry_run=False, timeout=None):
     try:
         return subprocess.run(cmd, check=check, text=True, capture_output=True, timeout=timeout)
     except subprocess.TimeoutExpired as exc:
-        if exc.stdout:
-            print(exc.stdout, end="")
-        if exc.stderr:
-            print(exc.stderr, end="", file=sys.stderr)
+        stdout_text, stderr_text = print_subprocess_output(exc.stdout, exc.stderr)
         timeout_desc = "unknown" if timeout is None else "%.1f" % timeout
-        raise RuntimeError("Command timed out after %s seconds: %s" % (timeout_desc, " ".join(shlex.quote(x) for x in cmd))) from exc
+        detail_lines = []
+        if stdout_text:
+            detail_lines.append("stdout tail:\n%s" % tail_text(stdout_text))
+        if stderr_text:
+            detail_lines.append("stderr tail:\n%s" % tail_text(stderr_text))
+        message = "Command timed out after %s seconds: %s" % (timeout_desc, " ".join(shlex.quote(x) for x in cmd))
+        if detail_lines:
+            message += "\n" + "\n".join(detail_lines)
+        raise RuntimeError(message) from exc
     except subprocess.CalledProcessError as exc:
-        if exc.stdout:
-            print(exc.stdout, end="")
-        if exc.stderr:
-            print(exc.stderr, end="", file=sys.stderr)
+        print_subprocess_output(exc.stdout, exc.stderr)
         raise
 
 
@@ -399,23 +427,73 @@ def run_rsync(camera_host, remote_dir, local_dir, dry_run=False, timeout_sec=CAM
     )
 
 
+def find_local_camera_raw_files(local_video_dir):
+    raw_files = []
+    seen = set()
+    for pattern in CAMERA_RAW_VIDEO_PATTERNS:
+        for path in sorted(local_video_dir.glob(pattern)):
+            if path in seen:
+                continue
+            seen.add(path)
+            if path.is_file():
+                raw_files.append(path)
+    return raw_files
+
+
+def verify_local_camera_raw_files(local_video_dir):
+    raw_files = []
+    empty_files = []
+    for path in find_local_camera_raw_files(local_video_dir):
+        size_bytes = path.stat().st_size
+        if size_bytes > 0:
+            raw_files.append(path)
+        else:
+            empty_files.append(path)
+
+    if empty_files:
+        raise RuntimeError(
+            "Empty camera raw files were found after rsync completed: %s"
+            % ", ".join(str(path) for path in empty_files)
+        )
+    if not raw_files:
+        raise RuntimeError(
+            "No .h264 camera files were found in the local video directory after rsync completed."
+        )
+    return raw_files
+
+
 def convert_h264_to_mp4(local_video_dir, framerate=CAMERA_FRAMERATE, dry_run=False, timeout_sec=CAMERA_FFMPEG_TIMEOUT_SEC):
     ffmpeg = shutil.which("ffmpeg")
     if ffmpeg is None:
-        print("ffmpeg not found; skipping mp4 conversion.")
-        return
+        raise RuntimeError(
+            "FFmpeg is not installed or not available on PATH; raw .h264 files were fetched but MP4 conversion could not run."
+        )
 
-    h264_files = sorted(local_video_dir.glob("*.h264"))
-    if not h264_files:
-        print("No .h264 files found for mp4 conversion.")
-        return
+    h264_files = verify_local_camera_raw_files(local_video_dir)
+    result = {
+        "conversion_attempted": False,
+        "conversion_completed": False,
+        "conversion_skipped": False,
+        "conversion_skip_reason": None,
+        "input_files": [str(path) for path in h264_files],
+        "output_files": [],
+    }
+
+    if dry_run:
+        result["conversion_skipped"] = True
+        result["conversion_skip_reason"] = "dry_run"
+        return result
 
     for input_path in h264_files:
         output_path = input_path.with_suffix(".mp4")
         if output_path.exists():
+            if output_path.stat().st_size <= 0:
+                raise RuntimeError("Existing MP4 file is empty: %s" % output_path)
             print("MP4 already exists, skipping: %s" % output_path)
+            result["output_files"].append(str(output_path))
             continue
 
+        result["conversion_attempted"] = True
         cmd = [
             ffmpeg,
             "-y",
@@ -430,25 +508,160 @@ def convert_h264_to_mp4(local_video_dir, framerate=CAMERA_FRAMERATE, dry_run=Fal
             str(output_path),
         ]
         print("+ " + " ".join(shlex.quote(x) for x in cmd))
-        if dry_run:
-            continue
         try:
             subprocess.run(cmd, check=True, text=True, capture_output=True, timeout=timeout_sec)
         except subprocess.TimeoutExpired as exc:
             if output_path.exists():
                 output_path.unlink()
-            if exc.stdout:
-                print(exc.stdout, end="")
-            if exc.stderr:
-                print(exc.stderr, end="", file=sys.stderr)
+            print_subprocess_output(exc.stdout, exc.stderr)
             raise RuntimeError("MP4 conversion timed out after %.1f seconds for %s" % (timeout_sec, input_path.name)) from exc
         except subprocess.CalledProcessError as exc:
-            if exc.stdout:
-                print(exc.stdout, end="")
-            if exc.stderr:
-                print(exc.stderr, end="", file=sys.stderr)
+            print_subprocess_output(exc.stdout, exc.stderr)
             raise
+
+        if not output_path.exists():
+            raise RuntimeError("FFmpeg returned successfully but did not create %s" % output_path)
+        if output_path.stat().st_size <= 0:
+            raise RuntimeError("FFmpeg created an empty MP4 file: %s" % output_path)
+
+        result["output_files"].append(str(output_path))
         print("Converted %s -> %s" % (input_path.name, output_path.name))
+
+    result["conversion_completed"] = bool(result["output_files"]) and len(result["output_files"]) == len(h264_files)
+    return result
+
+
+def run_camera_conversion_workflow(camera_host, local_video_dir, framerate=CAMERA_FRAMERATE, dry_run=False, timeout_sec=CAMERA_FFMPEG_TIMEOUT_SEC):
+    local_video_dir = Path(local_video_dir)
+    result = {
+        "camera_raw_files_verified": False,
+        "camera_raw_file_count": 0,
+        "raw_h264_available_locally": False,
+        "camera_conversion_attempted": False,
+        "camera_conversion_completed": False,
+        "camera_conversion_deferred": False,
+        "camera_conversion_error": "",
+        "camera_conversion_skip_reason": "",
+        "converted_mp4_files": [],
+        "conversion_result": None,
+    }
+
+    try:
+        raw_files = verify_local_camera_raw_files(local_video_dir)
+    except Exception as exc:
+        append_event(
+            local_video_dir,
+            "camera_raw_verification_failed",
+            {
+                "camera_host": camera_host,
+                "local_video_dir": str(local_video_dir),
+                "error": str(exc),
+            },
+        )
+        raise
+
+    result["camera_raw_files_verified"] = True
+    result["camera_raw_file_count"] = len(raw_files)
+    result["raw_h264_available_locally"] = True
+    append_event(
+        local_video_dir,
+        "camera_raw_files_verified",
+        {
+            "camera_host": camera_host,
+            "local_video_dir": str(local_video_dir),
+            "raw_file_count": len(raw_files),
+            "raw_files": [str(path) for path in raw_files],
+        },
+    )
+
+    ffmpeg = shutil.which("ffmpeg")
+    if ffmpeg is None:
+        error = (
+            "FFmpeg is not installed or not available on PATH; raw .h264 files were fetched but MP4 conversion could not run."
+        )
+        result["camera_conversion_deferred"] = True
+        result["camera_conversion_error"] = error
+        result["camera_conversion_skip_reason"] = "ffmpeg_not_available"
+        append_event(
+            local_video_dir,
+            "camera_conversion_deferred",
+            {
+                "camera_host": camera_host,
+                "local_video_dir": str(local_video_dir),
+                "reason": "ffmpeg_not_available",
+                "raw_h264_available_locally": True,
+                "error": error,
+            },
+        )
+        print(error, file=sys.stderr)
+        return result
+
+    append_event(
+        local_video_dir,
+        "camera_conversion_started",
+        {
+            "camera_host": camera_host,
+            "local_video_dir": str(local_video_dir),
+            "ffmpeg_timeout_sec": timeout_sec,
+            "raw_file_count": len(raw_files),
+        },
+    )
+
+    try:
+        conversion_result = convert_h264_to_mp4(
+            local_video_dir,
+            framerate=framerate,
+            dry_run=dry_run,
+            timeout_sec=timeout_sec,
+        )
+    except Exception as exc:
+        result["camera_conversion_attempted"] = True
+        result["camera_conversion_deferred"] = True
+        result["camera_conversion_error"] = str(exc)
+        append_event(
+            local_video_dir,
+            "camera_conversion_failed",
+            {
+                "camera_host": camera_host,
+                "local_video_dir": str(local_video_dir),
+                "ffmpeg_timeout_sec": timeout_sec,
+                "error": str(exc),
+            },
+        )
+        print("MP4 conversion did not complete.", file=sys.stderr)
+        return result
+
+    result["conversion_result"] = conversion_result
+    result["camera_conversion_attempted"] = bool(conversion_result.get("conversion_attempted"))
+    result["camera_conversion_completed"] = bool(conversion_result.get("conversion_completed"))
+    result["camera_conversion_deferred"] = bool(conversion_result.get("conversion_skipped"))
+    result["camera_conversion_skip_reason"] = conversion_result.get("conversion_skip_reason") or ""
+    result["converted_mp4_files"] = list(conversion_result.get("output_files", []))
+
+    if result["camera_conversion_completed"]:
+        append_event(
+            local_video_dir,
+            "camera_conversion_completed",
+            {
+                "camera_host": camera_host,
+                "local_video_dir": str(local_video_dir),
+                "converted_mp4_files": result["converted_mp4_files"],
+                "raw_file_count": len(raw_files),
+            },
+        )
+    else:
+        append_event(
+            local_video_dir,
+            "camera_conversion_deferred",
+            {
+                "camera_host": camera_host,
+                "local_video_dir": str(local_video_dir),
+                "reason": result["camera_conversion_skip_reason"] or "dry_run",
+                "raw_h264_available_locally": True,
+            },
+        )
+
+    return result
 
 
 def append_event(local_video_dir, event, details=None):
@@ -926,7 +1139,8 @@ def convert_camera(args, state=None):
     )
 
     try:
-        convert_h264_to_mp4(
+        conversion_state = run_camera_conversion_workflow(
+            camera_host,
             local_video_dir,
             framerate=state.get("framerate", CAMERA_FRAMERATE),
             dry_run=args.dry_run,
@@ -951,51 +1165,13 @@ def convert_camera(args, state=None):
         print("MP4 conversion did not complete.", file=sys.stderr)
         return state
 
-    state["camera_conversion_completed"] = True
-    state["camera_conversion_completed_utc"] = utc_iso_now()
-    state["camera_conversion_deferred"] = False
-    state["raw_h264_available_locally"] = True
-    append_event(
-        local_video_dir,
-        "camera_conversion_completed",
-        {
-            "camera_host": camera_host,
-            "local_video_dir": str(local_video_dir),
-        },
-    )
-    print("Converted camera files in: %s" % local_video_dir)
+    state.update(conversion_state)
+    state["camera_conversion_completed_utc"] = utc_iso_now() if conversion_state.get("camera_conversion_completed") else ""
+    state["camera_conversion_failed"] = False
+    state["camera_conversion_failed_utc"] = ""
+    if conversion_state.get("camera_conversion_completed"):
+        print("Converted camera files in: %s" % local_video_dir)
     return state
-
-
-def status_camera(args):
-    state = load_state() if STATE_FILE.exists() else None
-    camera_host = resolve_camera_host(args, state)
-    remote_pid_file = None
-    remote_log_file = None
-    if state:
-        remote_pid_file = state.get("remote_pid_file")
-        remote_log_file = state.get("remote_log_file")
-    if not remote_pid_file:
-        remote_pid_file = "%s/camera_acquisition.pid" % (state.get("remote_video_dir") if state else REMOTE_VIDEO_ROOT)
-    if not remote_log_file:
-        remote_log_file = "%s/camera_acquisition.log" % (state.get("remote_video_dir") if state else REMOTE_VIDEO_ROOT)
-    remote_cmd = (
-        "echo '--- saved camera state ---'; "
-        "if [ -f %s ]; then cat %s; else echo 'No pid file'; fi; "
-        "echo '--- camera acquisition processes ---'; "
-        "pid=$(cat %s 2>/dev/null || true); "
-        "if [ -n \"$pid\" ] && kill -0 \"$pid\" 2>/dev/null; then echo RUNNING:$pid; else echo NOT_RUNNING; fi; "
-        "echo '--- recent camera logs ---'; "
-        "tail -n 20 %s 2>/dev/null || true"
-        % (
-            shlex.quote(remote_pid_file),
-            shlex.quote(remote_pid_file),
-            shlex.quote(remote_pid_file),
-            shlex.quote(remote_log_file),
-        )
-    )
-    run_ssh(camera_host, remote_cmd, dry_run=args.dry_run, timeout=CAMERA_START_READY_TIMEOUT_SEC)
-
 
 def fetch_camera(args, state=None):
     if getattr(args, "rsync_timeout_sec", CAMERA_RSYNC_TIMEOUT_SEC) <= 0:
@@ -1013,11 +1189,15 @@ def fetch_camera(args, state=None):
     remote_video_dir = state["remote_video_dir"]
     local_video_dir = Path(state["local_video_dir"])
     local_video_dir.mkdir(parents=True, exist_ok=True)
+    state["camera_transfer_command_completed"] = False
     state["camera_fetch_completed"] = False
+    state["camera_conversion_attempted"] = False
     state["camera_conversion_completed"] = False
     state["camera_conversion_deferred"] = False
     state["camera_fetch_timed_out"] = False
+    state["camera_raw_files_verified"] = False
     state["raw_h264_available_locally"] = False
+    state["converted_mp4_files"] = []
 
     append_event(
         local_video_dir,
@@ -1059,7 +1239,7 @@ def fetch_camera(args, state=None):
         )
         raise
 
-    state["camera_fetch_completed"] = True
+    state["camera_transfer_command_completed"] = True
     state["camera_fetch_returned_utc"] = utc_iso_now()
     append_event(
         local_video_dir,
@@ -1080,48 +1260,46 @@ def fetch_camera(args, state=None):
             "ffmpeg_timeout_sec": getattr(args, "ffmpeg_timeout_sec", CAMERA_FFMPEG_TIMEOUT_SEC),
         },
     )
+
     try:
-        convert_h264_to_mp4(
+        conversion_state = run_camera_conversion_workflow(
+            camera_host,
             local_video_dir,
             framerate=state.get("framerate", CAMERA_FRAMERATE),
             dry_run=args.dry_run,
             timeout_sec=getattr(args, "ffmpeg_timeout_sec", CAMERA_FFMPEG_TIMEOUT_SEC),
         )
     except Exception as exc:
-        state["camera_conversion_failed"] = True
-        state["camera_conversion_failed_utc"] = utc_iso_now()
-        state["camera_conversion_error"] = str(exc)
-        state["camera_conversion_completed"] = False
-        state["raw_h264_available_locally"] = True
+        state["camera_fetch_failed"] = True
+        state["camera_fetch_failed_utc"] = utc_iso_now()
+        state["camera_fetch_error"] = str(exc)
         append_event(
             local_video_dir,
-            "camera_conversion_failed",
+            "camera_fetch_failed",
             {
                 "camera_host": camera_host,
+                "remote_video_dir": remote_video_dir,
                 "local_video_dir": str(local_video_dir),
-                "ffmpeg_timeout_sec": getattr(args, "ffmpeg_timeout_sec", CAMERA_FFMPEG_TIMEOUT_SEC),
+                "stage": "raw_verification",
                 "error": str(exc),
             },
         )
-        print("Camera files were transferred, but MP4 conversion did not complete.", file=sys.stderr)
-        print("Raw .h264 files are available locally at: %s" % local_video_dir, file=sys.stderr)
-        return state
+        raise
 
-    state["camera_conversion_completed"] = True
-    state["camera_conversion_completed_utc"] = utc_iso_now()
-    state["raw_h264_available_locally"] = True
-    append_event(
-        local_video_dir,
-        "camera_conversion_completed",
-        {
-            "camera_host": camera_host,
-            "local_video_dir": str(local_video_dir),
-        },
-    )
-
+    state.update(conversion_state)
+    state["camera_fetch_completed"] = True
+    state["camera_fetch_completed_utc"] = utc_iso_now()
+    state["raw_h264_available_locally"] = bool(conversion_state.get("raw_h264_available_locally"))
+    state["camera_raw_files_verified"] = bool(conversion_state.get("camera_raw_files_verified"))
+    state["camera_raw_file_count"] = conversion_state.get("camera_raw_file_count", 0)
+    state["camera_conversion_attempted"] = bool(conversion_state.get("camera_conversion_attempted"))
+    state["camera_conversion_completed"] = bool(conversion_state.get("camera_conversion_completed"))
+    state["camera_conversion_deferred"] = bool(conversion_state.get("camera_conversion_deferred"))
+    state["camera_conversion_error"] = conversion_state.get("camera_conversion_error", "")
+    state["camera_conversion_skip_reason"] = conversion_state.get("camera_conversion_skip_reason", "")
+    state["converted_mp4_files"] = conversion_state.get("converted_mp4_files", [])
     print("Fetched camera files to: %s" % local_video_dir)
     return state
-
 
 def status_camera(args):
     state = load_state() if STATE_FILE.exists() else None

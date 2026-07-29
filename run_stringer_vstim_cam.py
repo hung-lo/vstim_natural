@@ -34,6 +34,21 @@ CAMERA_CONTROL_FETCH_HARD_TIMEOUT_SEC = 600.0
 CAMERA_CONTROL_RESULT_PREFIX = "CAMERA_CONTROL_RESULT_JSON="
 
 
+def subprocess_output_to_text(value):
+    if value is None:
+        return ""
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    return str(value)
+
+
+def tail_text(text, max_chars=4000):
+    text = text or ""
+    if len(text) <= max_chars:
+        return text
+    return "...[truncated]...\n" + text[-max_chars:]
+
+
 def _log_completed_process(proc, label):
     stdout, stderr = proc.communicate()
     if stdout:
@@ -56,19 +71,29 @@ def run_camera_control(args, background=False, timeout=None):
     try:
         result = subprocess.run(cmd, check=True, text=True, capture_output=True, timeout=timeout)
     except subprocess.TimeoutExpired as exc:
-        if exc.stdout:
-            print(exc.stdout, end="")
-        if exc.stderr:
-            print(exc.stderr, end="", file=sys.stderr)
+        stdout_text = subprocess_output_to_text(exc.stdout)
+        stderr_text = subprocess_output_to_text(exc.stderr)
+        if stdout_text:
+            print(stdout_text, end="" if stdout_text.endswith("\n") else "\n")
+        if stderr_text:
+            print(stderr_text, end="" if stderr_text.endswith("\n") else "\n", file=sys.stderr)
         timeout_desc = "unknown" if timeout is None else "%.1f" % timeout
-        raise RuntimeError(
-            "Camera controller exceeded the %s-second emergency timeout." % timeout_desc
-        ) from exc
+        detail_lines = []
+        if stdout_text:
+            detail_lines.append("stdout tail:\n%s" % tail_text(stdout_text))
+        if stderr_text:
+            detail_lines.append("stderr tail:\n%s" % tail_text(stderr_text))
+        message = "Camera controller exceeded the %s-second emergency timeout." % timeout_desc
+        if detail_lines:
+            message += "\n" + "\n".join(detail_lines)
+        raise RuntimeError(message) from exc
     except subprocess.CalledProcessError as exc:
-        if exc.stdout:
-            print(exc.stdout, end="")
-        if exc.stderr:
-            print(exc.stderr, end="", file=sys.stderr)
+        stdout_text = subprocess_output_to_text(exc.stdout)
+        stderr_text = subprocess_output_to_text(exc.stderr)
+        if stdout_text:
+            print(stdout_text, end="" if stdout_text.endswith("\n") else "\n")
+        if stderr_text:
+            print(stderr_text, end="" if stderr_text.endswith("\n") else "\n", file=sys.stderr)
         raise
 
     if result.stdout:
