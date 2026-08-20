@@ -16,7 +16,7 @@ What the runtime does:
 
 - asks for mouse ID and optional session notes
 - asks for number of images and repeats, using the current defaults when you just press Enter
-- confirms the session settings and estimated playback time before starting
+- confirms the session settings and exact planned stimulus-sequence duration before starting
 - chooses a reproducible subset of Stringer center-crop PNGs
 - bakes session-specific `rpg` raw files at startup
 - displays each image fullscreen for a fixed duration
@@ -129,8 +129,9 @@ The helper functions already bake the patch into the session raw files.
 Image selection, trial order, and ITI jitter use independent random-number
 generators. The resolved seeds are written to the session metadata. The
 planned-sequence CSV records `planned_stim_duration_sec`,
-`planned_iti_frames`, and `planned_iti_duration_sec` for every trial, and the
-event log records the same planned ITI for each `iti_on` event.
+`planned_iti_frames`, `planned_iti_duration_sec`, and `iti_will_play` for every
+trial. Session metadata records `planned_sequence_duration_sec`, and the event
+log records the same planned ITI for each `iti_on` event.
 
 Only the 19 possible ITI raw files are cached per session:
 `gray_iti_042f.raw` through `gray_iti_060f.raw`.

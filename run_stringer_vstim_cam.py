@@ -889,7 +889,8 @@ def main():
     all_pngs = base.list_png_files(image_dir)
     selected_pngs = base.select_image_subset(all_pngs, n_images_to_use)
     trials, sequence_seed, iti_jitter_seed = base.make_trial_sequence(selected_pngs, n_repeats)
-    estimated_playback_sec = base.estimate_playback_seconds(len(trials))
+    base.set_iti_playback_flags(trials, include_final_iti=False)
+    planned_playback_sec = base.calculate_planned_sequence_duration(trials, include_final_iti=False)
 
     print()
     print("Session setup summary:")
@@ -905,7 +906,9 @@ def main():
     print("  Type y and Enter to stop the camera and end the black baseline")
     print("  The screen stays black during camera stop and file transfer")
     print("  Total trials: %d" % len(trials))
-    print("  Estimated playback time: %s" % base.format_seconds(estimated_playback_sec))
+    print("  Stimulus duration: %.3f s" % base.STIM_DURATION_SEC)
+    print("  ITI range: %.3f-%.3f s (%d-%d frames)" % (base.ITI_MIN_SEC, base.ITI_MAX_SEC, base.iti_frame_bounds()[0], base.iti_frame_bounds()[1]))
+    print("  Planned stimulus sequence duration: %s" % base.format_duration(planned_playback_sec))
     print("  Output folder root: %s" % OUTPUT_ROOT)
     print("  Session folder name: %s" % base.make_session_name(mouse_id, "YYYYMMDDThhmmssZ"))
 
@@ -955,6 +958,7 @@ def main():
                 "planned_stim_duration_sec": trial["planned_stim_duration_sec"],
                 "planned_iti_frames": trial["planned_iti_frames"],
                 "planned_iti_duration_sec": trial["planned_iti_duration_sec"],
+                "iti_will_play": trial["iti_will_play"],
             }
             for trial in trials
         ],
@@ -968,6 +972,7 @@ def main():
             "planned_stim_duration_sec",
             "planned_iti_frames",
             "planned_iti_duration_sec",
+            "iti_will_play",
         ],
     )
 
@@ -985,6 +990,7 @@ def main():
         "refresh_rate_hz": base.REFRESH_RATE_HZ,
         "n_images_to_use": n_images_to_use,
         "n_repeats": n_repeats,
+        "planned_sequence_duration_sec": planned_playback_sec,
         "image_subset_seed": base.IMAGE_SUBSET_SEED,
         "resolved_image_subset_seed": base.IMAGE_SUBSET_SEED,
         "trial_order_seed": base.TRIAL_ORDER_SEED,

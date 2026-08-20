@@ -235,6 +235,26 @@ def make_trial_sequence(selected_image_files, n_repeats):
     return trials, seed, iti_seed
 
 
+def set_iti_playback_flags(trials, include_final_iti=True):
+    """Record which planned ITIs will actually be displayed by this runner."""
+    for index, trial in enumerate(trials):
+        trial["iti_will_play"] = bool(include_final_iti or index < len(trials) - 1)
+    return trials
+
+
+def calculate_planned_sequence_duration(trials, include_final_iti=True):
+    """Return stimulus plus actually displayed ITI time from the trial plan."""
+    total = 0.0
+    for index, trial in enumerate(trials):
+        total += float(trial["planned_stim_duration_sec"])
+        iti_will_play = trial.get("iti_will_play")
+        if iti_will_play is None:
+            iti_will_play = include_final_iti or index < len(trials) - 1
+        if iti_will_play:
+            total += float(trial["planned_iti_duration_sec"])
+    return total
+
+
 def write_csv(path, rows, fieldnames):
     ensure_dir(path.parent)
     with path.open("w", newline="") as handle:
@@ -516,9 +536,12 @@ def format_seconds(seconds):
     return "%02d:%02d:%02d" % (hours, minutes, secs)
 
 
-def estimate_playback_seconds(total_trials):
-    average_iti_sec = (ITI_MIN_SEC + ITI_MAX_SEC) / 2.0
-    return INITIAL_GRAY_SEC + FINAL_GRAY_SEC + total_trials * (STIM_DURATION_SEC + average_iti_sec)
+def format_duration(seconds):
+    total_tenths = int(round(max(0.0, float(seconds)) * 10.0))
+    hours, remainder = divmod(total_tenths, 36000)
+    minutes, remainder = divmod(remainder, 600)
+    whole_seconds, tenths = divmod(remainder, 10)
+    return "%02d:%02d:%02d.%d" % (hours, minutes, whole_seconds, tenths)
 
 
 def print_progress(trial_number, total_trials, start_time):
@@ -552,7 +575,8 @@ def main():
     all_pngs = list_png_files(image_dir)
     selected_pngs = select_image_subset(all_pngs, n_images_to_use)
     trials, sequence_seed, iti_jitter_seed = make_trial_sequence(selected_pngs, n_repeats)
-    estimated_playback_sec = estimate_playback_seconds(len(trials))
+    set_iti_playback_flags(trials, include_final_iti=True)
+    planned_playback_sec = calculate_planned_sequence_duration(trials, include_final_iti=True)
 
     print()
     print("Session setup summary:")
@@ -561,7 +585,9 @@ def main():
     print("  Number of unique images: %d" % len(selected_pngs))
     print("  Repeats per image: %d" % n_repeats)
     print("  Total trials: %d" % len(trials))
-    print("  Estimated playback time: %s" % format_seconds(estimated_playback_sec))
+    print("  Stimulus duration: %.3f s" % STIM_DURATION_SEC)
+    print("  ITI range: %.3f-%.3f s (%d-%d frames)" % (ITI_MIN_SEC, ITI_MAX_SEC, iti_frame_bounds()[0], iti_frame_bounds()[1]))
+    print("  Planned stimulus sequence duration: %s" % format_duration(planned_playback_sec))
     print("  Output folder root: %s" % OUTPUT_ROOT)
     print("  Session folder name: %s" % make_session_name(mouse_id, "YYYYMMDDThhmmssZ"))
 
@@ -610,6 +636,7 @@ def main():
                 "planned_stim_duration_sec": trial["planned_stim_duration_sec"],
                 "planned_iti_frames": trial["planned_iti_frames"],
                 "planned_iti_duration_sec": trial["planned_iti_duration_sec"],
+                "iti_will_play": trial["iti_will_play"],
             }
             for trial in trials
         ],
@@ -623,6 +650,7 @@ def main():
             "planned_stim_duration_sec",
             "planned_iti_frames",
             "planned_iti_duration_sec",
+            "iti_will_play",
         ],
     )
 
@@ -640,6 +668,7 @@ def main():
         "refresh_rate_hz": REFRESH_RATE_HZ,
         "n_images_to_use": n_images_to_use,
         "n_repeats": n_repeats,
+        "planned_sequence_duration_sec": planned_playback_sec,
         "image_subset_seed": IMAGE_SUBSET_SEED,
         "resolved_image_subset_seed": IMAGE_SUBSET_SEED,
         "trial_order_seed": TRIAL_ORDER_SEED,
