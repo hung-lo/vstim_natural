@@ -193,6 +193,97 @@ def iti_duration_sec(iti_frames):
     return float(iti_frames) / REFRESH_RATE_HZ
 
 
+def _remaining_sequence_is_feasible(counts, previous_image_id=None):
+    """Return whether the remaining image multiset can avoid adjacent repeats."""
+    remaining_total = sum(counts.values())
+    if remaining_total == 0:
+        return True
+
+    largest_count = max(counts.values())
+    if largest_count > (remaining_total + 1) // 2:
+        return False
+
+    # The first remaining item cannot equal the image already at the end of
+    # the sequence, so that image needs a different item before every copy.
+    if previous_image_id in counts:
+        previous_count = counts[previous_image_id]
+        if previous_count > remaining_total - previous_count:
+            return False
+    return True
+
+
+def shuffle_trials_without_adjacent_images(base_trials, rng):
+    """Randomize trials while guaranteeing no adjacent image IDs.
+
+    Trial dictionaries within each image bucket are shuffled first, then image
+    buckets are scheduled with a feasibility check after every proposed pick.
+    """
+    buckets = {}
+    for trial in base_trials:
+        buckets.setdefault(trial["image_id"], []).append(trial)
+    for bucket in buckets.values():
+        rng.shuffle(bucket)
+
+    counts = {image_id: len(bucket) for image_id, bucket in buckets.items()}
+    if not _remaining_sequence_is_feasible(counts):
+        raise ValueError(
+            "Cannot avoid adjacent repeated images: the largest image count "
+            "is too large for the requested trial multiset."
+        )
+
+    shuffled_trials = []
+    previous_image_id = None
+    while counts:
+        candidates = []
+        for image_id, count in counts.items():
+            if image_id == previous_image_id or count <= 0:
+                continue
+            remaining_counts = dict(counts)
+            remaining_counts[image_id] -= 1
+            if remaining_counts[image_id] == 0:
+                del remaining_counts[image_id]
+            if _remaining_sequence_is_feasible(remaining_counts, image_id):
+                candidates.append(image_id)
+
+        if not candidates:
+            raise ValueError(
+                "Cannot avoid adjacent repeated images after scheduling %d trials; "
+                "the requested image counts are infeasible from the current state."
+                % len(shuffled_trials)
+            )
+
+        # Sampling proportional to remaining counts preserves randomness while
+        # reducing the chance that a large bucket is stranded at the end.
+        candidate_total = sum(counts[image_id] for image_id in candidates)
+        selected_index = rng.randrange(candidate_total)
+        selected_image_id = candidates[-1]
+        for image_id in candidates:
+            selected_index -= counts[image_id]
+            if selected_index < 0:
+                selected_image_id = image_id
+                break
+
+        shuffled_trials.append(buckets[selected_image_id].pop())
+        counts[selected_image_id] -= 1
+        if counts[selected_image_id] == 0:
+            del counts[selected_image_id]
+        previous_image_id = selected_image_id
+
+    adjacent_repeat_count = count_adjacent_image_repeats(shuffled_trials)
+    if AVOID_ADJACENT_REPEATS and adjacent_repeat_count:
+        raise AssertionError(
+            "Adjacent-repeat scheduler returned %d repeated neighbors." % adjacent_repeat_count
+        )
+    return shuffled_trials
+
+
+def count_adjacent_image_repeats(trials):
+    return sum(
+        trials[index]["image_id"] == trials[index - 1]["image_id"]
+        for index in range(1, len(trials))
+    )
+
+
 def make_trial_sequence(selected_image_files, n_repeats):
     seed = resolve_seed(TRIAL_ORDER_SEED)
     iti_seed = resolve_seed(ITI_JITTER_SEED)
@@ -214,12 +305,7 @@ def make_trial_sequence(selected_image_files, n_repeats):
             )
 
     if AVOID_ADJACENT_REPEATS:
-        for _ in range(1000):
-            rng.shuffle(base_trials)
-            if all(base_trials[i]["image_id"] != base_trials[i - 1]["image_id"] for i in range(1, len(base_trials))):
-                break
-        else:
-            print("Warning: could not fully avoid adjacent repeated images.")
+        base_trials = shuffle_trials_without_adjacent_images(base_trials, rng)
     else:
         rng.shuffle(base_trials)
 
@@ -575,6 +661,7 @@ def main():
     all_pngs = list_png_files(image_dir)
     selected_pngs = select_image_subset(all_pngs, n_images_to_use)
     trials, sequence_seed, iti_jitter_seed = make_trial_sequence(selected_pngs, n_repeats)
+    adjacent_repeat_count = count_adjacent_image_repeats(trials)
     set_iti_playback_flags(trials, include_final_iti=True)
     planned_playback_sec = calculate_planned_sequence_duration(trials, include_final_iti=True)
 
@@ -674,6 +761,8 @@ def main():
         "trial_order_seed": TRIAL_ORDER_SEED,
         "resolved_trial_order_seed": sequence_seed,
         "avoid_adjacent_repeats": AVOID_ADJACENT_REPEATS,
+        "adjacent_repeat_count": adjacent_repeat_count,
+        "adjacent_repeat_constraint_satisfied": adjacent_repeat_count == 0,
         "stim_duration_sec": STIM_DURATION_SEC,
         "iti_mode": "uniform_discrete_frames",
         "iti_min_sec": ITI_MIN_SEC,

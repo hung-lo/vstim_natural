@@ -430,6 +430,27 @@ def prestimulus_result_message(baseline_result):
     return "Pre-stimulus baseline complete. Starting visual stimulus playback..."
 
 
+def make_prestim_gray_event_row(iti_raw_path, baseline_iti_frames, baseline_perf, baseline_timing):
+    """Build the prestim gray event using the display request timestamp."""
+    return {
+        "utc_iso": baseline_timing["request_utc_iso"],
+        "unix_time_utc_sec": baseline_timing["request_unix_sec"],
+        "event_type": "prestim_gray_on",
+        "raw_path": str(iti_raw_path),
+        "planned_duration_sec": base.iti_duration_sec(baseline_iti_frames),
+        "display_request_unix_ns": baseline_timing["request_unix_ns"],
+        "display_return_unix_ns": baseline_timing["return_unix_ns"],
+        "display_return_utc_iso": baseline_timing["return_utc_iso"],
+        "display_request_perf_counter_ns": baseline_timing["request_perf_counter_ns"],
+        "display_return_perf_counter_ns": baseline_timing["return_perf_counter_ns"],
+        "display_call_duration_sec": "%.9f" % baseline_timing["duration_sec"],
+        "start_time_unix": getattr(baseline_perf, "start_time", ""),
+        "mean_interframe_us": getattr(baseline_perf, "mean_interframe", ""),
+        "stddev_interframe_us": getattr(baseline_perf, "stddev_interframe", ""),
+        "notes": "condition=gray_iti; photodiode=off; screen_opened_before_camera=true",
+    }
+
+
 def run_poststim_black_baseline(screen, iti_raw, event_log_path, stimulus_playback_completed=True):
     baseline_iti_sec = base.iti_duration_sec(base.iti_frame_bounds()[1])
     final_gray_repeats = max(1, int(math.ceil(base.POSTSTIM_GRAY_PLANNED_SEC / baseline_iti_sec)))
@@ -889,6 +910,7 @@ def main():
     all_pngs = base.list_png_files(image_dir)
     selected_pngs = base.select_image_subset(all_pngs, n_images_to_use)
     trials, sequence_seed, iti_jitter_seed = base.make_trial_sequence(selected_pngs, n_repeats)
+    adjacent_repeat_count = base.count_adjacent_image_repeats(trials)
     base.set_iti_playback_flags(trials, include_final_iti=False)
     planned_playback_sec = base.calculate_planned_sequence_duration(trials, include_final_iti=False)
 
@@ -996,6 +1018,8 @@ def main():
         "trial_order_seed": base.TRIAL_ORDER_SEED,
         "resolved_trial_order_seed": sequence_seed,
         "avoid_adjacent_repeats": base.AVOID_ADJACENT_REPEATS,
+        "adjacent_repeat_count": adjacent_repeat_count,
+        "adjacent_repeat_constraint_satisfied": adjacent_repeat_count == 0,
         "stim_duration_sec": base.STIM_DURATION_SEC,
         "iti_mode": "uniform_discrete_frames",
         "iti_min_sec": base.ITI_MIN_SEC,
@@ -1062,6 +1086,9 @@ def main():
     prestim_gray_start_monotonic = None
     prestim_baseline_start_utc = ""
     prestim_baseline_start_monotonic = None
+    prestim_gate_released_utc = ""
+    prestim_gate_released_unix_sec = ""
+    prestim_gate_released_unix_ns = ""
     baseline_result = None
     poststim_result = None
     camera_stop_handled = False
@@ -1093,21 +1120,12 @@ def main():
                 screen_gray_active = True
                 base.append_csv_row(
                     event_log_path,
-                    {
-                        "event_type": "prestim_gray_on",
-                        "raw_path": str(iti_raw_path),
-                        "planned_duration_sec": base.iti_duration_sec(baseline_iti_frames),
-                        "display_request_unix_ns": baseline_timing["request_unix_ns"],
-                        "display_return_unix_ns": baseline_timing["return_unix_ns"],
-                        "display_return_utc_iso": baseline_timing["return_utc_iso"],
-                        "display_request_perf_counter_ns": baseline_timing["request_perf_counter_ns"],
-                        "display_return_perf_counter_ns": baseline_timing["return_perf_counter_ns"],
-                        "display_call_duration_sec": "%.9f" % baseline_timing["duration_sec"],
-                        "start_time_unix": getattr(baseline_perf, "start_time", ""),
-                        "mean_interframe_us": getattr(baseline_perf, "mean_interframe", ""),
-                        "stddev_interframe_us": getattr(baseline_perf, "stddev_interframe", ""),
-                        "notes": "condition=gray_iti; photodiode=off; screen_opened_before_camera=true",
-                    },
+                    make_prestim_gray_event_row(
+                        iti_raw_path,
+                        baseline_iti_frames,
+                        baseline_perf,
+                        baseline_timing,
+                    ),
                     base.EVENT_FIELDS,
                 )
                 print("Pre-stimulus gray screen is active.")
@@ -1222,6 +1240,10 @@ def main():
                     base.INITIAL_GRAY_SEC,
                     force_start_event,
                 )
+                prestim_gate_timestamp = base.capture_timestamp()
+                prestim_gate_released_utc = prestim_gate_timestamp["utc_iso"]
+                prestim_gate_released_unix_sec = prestim_gate_timestamp["unix_sec"]
+                prestim_gate_released_unix_ns = prestim_gate_timestamp["unix_ns"]
                 stop_prestimulus_early_start_monitor(force_input_stop_event, force_input_thread)
                 force_input_thread = None
                 force_input_stop_event = None
@@ -1230,7 +1252,10 @@ def main():
                 base.append_csv_row(
                     event_log_path,
                     {
+                        "utc_iso": prestim_gate_released_utc,
+                        "unix_time_utc_sec": prestim_gate_released_unix_sec,
                         "event_type": "prestim_baseline_end",
+                        "display_request_unix_ns": prestim_gate_released_unix_ns,
                         "notes": "reason=%s; requested_sec=%.3f; camera_elapsed_sec=%.3f; gray_elapsed_sec=%.3f; forced=%s; waited_for_minimum_gray_after_override=%s"
                         % (
                             baseline_result["end_reason"],
@@ -1426,7 +1451,9 @@ def main():
         metadata["raw_cache_build_duration_sec"] = raw_cache_build_duration_sec if raw_cache_build_duration_sec is not None else ""
         metadata["raw_cache_built_with_screen_open"] = raw_cache_built_with_screen_open
         metadata["raw_cache_screen_compatibility_fallback"] = raw_cache_screen_compatibility_fallback
-        metadata["prestim_gate_released_utc"] = base.utc_iso_now() if baseline_result else ""
+        metadata["prestim_gate_released_utc"] = prestim_gate_released_utc
+        metadata["prestim_gate_released_unix_sec"] = prestim_gate_released_unix_sec
+        metadata["prestim_gate_released_unix_ns"] = prestim_gate_released_unix_ns
         metadata_path.write_text(json.dumps(metadata, indent=2, sort_keys=True) + chr(10))
         if session_completed:
             print("Session finished. Files are in: %s" % session_root)

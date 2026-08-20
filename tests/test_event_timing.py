@@ -23,6 +23,7 @@ sys.modules.setdefault("PIL.ImageOps", imageops)
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import run_stringer_vstim as base
+import run_stringer_vstim_cam as cam
 
 
 class EventTimingTests(unittest.TestCase):
@@ -92,6 +93,27 @@ class EventTimingTests(unittest.TestCase):
         self.assertEqual(row["unix_time_utc_sec"], "1689000123.456789012")
         self.assertEqual(row["event_type"], "session_start")
         self.assertEqual(row["notes"], "screen_opened")
+
+    def test_prestim_gray_event_uses_display_request_timestamp(self):
+        timing = {
+            "request_utc_iso": "2026-01-01T00:00:00.000000000+00:00",
+            "request_unix_sec": "1767225600.000000000",
+            "request_unix_ns": 1767225600000000000,
+            "return_utc_iso": "2026-01-01T00:00:01.000000000+00:00",
+            "return_unix_ns": 1767225601000000000,
+            "request_perf_counter_ns": 10,
+            "return_perf_counter_ns": 1_000_000_010,
+            "duration_sec": 1.0,
+        }
+        perf = SimpleNamespace(start_time=12.0, mean_interframe=34.0, stddev_interframe=5.0)
+
+        row = cam.make_prestim_gray_event_row(Path("/tmp/gray.raw"), 60, perf, timing)
+
+        self.assertEqual(row["utc_iso"], timing["request_utc_iso"])
+        self.assertEqual(row["unix_time_utc_sec"], timing["request_unix_sec"])
+        self.assertEqual(row["display_request_unix_ns"], timing["request_unix_ns"])
+        self.assertEqual(row["display_return_utc_iso"], timing["return_utc_iso"])
+
 
     def test_run_trial_sequence_logs_stim_then_iti_without_interleaving(self):
         call_order = []
