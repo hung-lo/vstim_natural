@@ -39,7 +39,11 @@ TRIAL_ORDER_SEED = None
 AVOID_ADJACENT_REPEATS = True
 
 STIM_DURATION_SEC = 0.5
-ITI_DURATION_SEC = 0.75
+ITI_MIN_SEC = 0.7
+ITI_MAX_SEC = 1.0
+ITI_JITTER_SEED = None
+# Compatibility value for callers that only need an approximate planning value.
+ITI_DURATION_SEC = (ITI_MIN_SEC + ITI_MAX_SEC) / 2.0
 INITIAL_GRAY_SEC = 3.0
 FINAL_GRAY_SEC = 3.0
 POSTSTIM_GRAY_PLANNED_SEC = FINAL_GRAY_SEC
@@ -67,6 +71,7 @@ EVENT_FIELDS = [
     "image_filename",
     "raw_path",
     "planned_duration_sec",
+    "planned_iti_frames",
     "display_request_unix_ns",
     "display_return_unix_ns",
     "display_return_utc_iso",
@@ -171,13 +176,29 @@ def select_image_subset(all_image_files, n_images_to_use):
     return sorted(rng.sample(list(all_image_files), n_images_to_use))
 
 
+def resolve_seed(configured_seed):
+    if configured_seed is None:
+        return int(time.time_ns() % (2 ** 32))
+    return int(configured_seed)
+
+
+def iti_frame_bounds():
+    return (
+        int(round(ITI_MIN_SEC * REFRESH_RATE_HZ)),
+        int(round(ITI_MAX_SEC * REFRESH_RATE_HZ)),
+    )
+
+
+def iti_duration_sec(iti_frames):
+    return float(iti_frames) / REFRESH_RATE_HZ
+
+
 def make_trial_sequence(selected_image_files, n_repeats):
-    if TRIAL_ORDER_SEED is None:
-        seed = int(time.time_ns() % (2 ** 32))
-    else:
-        seed = int(TRIAL_ORDER_SEED)
+    seed = resolve_seed(TRIAL_ORDER_SEED)
+    iti_seed = resolve_seed(ITI_JITTER_SEED)
 
     rng = random.Random(seed)
+    iti_rng = random.Random(iti_seed)
     base_trials = []
     for repeat_idx in range(n_repeats):
         for selected_index, path in enumerate(selected_image_files):
@@ -207,9 +228,11 @@ def make_trial_sequence(selected_image_files, n_repeats):
         row = dict(trial)
         row["trial_index"] = trial_index
         row["planned_stim_duration_sec"] = STIM_DURATION_SEC
-        row["planned_iti_duration_sec"] = ITI_DURATION_SEC
+        iti_frames = iti_rng.randint(*iti_frame_bounds())
+        row["planned_iti_frames"] = iti_frames
+        row["planned_iti_duration_sec"] = iti_duration_sec(iti_frames)
         trials.append(row)
-    return trials, seed
+    return trials, seed, iti_seed
 
 
 def write_csv(path, rows, fieldnames):
@@ -329,6 +352,7 @@ def make_display_event_row(event_type, trial, raw_path, planned_duration_sec, pe
         "image_filename": trial["image_filename"],
         "raw_path": str(raw_path),
         "planned_duration_sec": planned_duration_sec,
+        "planned_iti_frames": trial.get("planned_iti_frames", "") if event_type == "iti_on" else "",
         "display_request_unix_ns": timing["request_unix_ns"],
         "display_return_unix_ns": timing["return_unix_ns"],
         "display_return_utc_iso": timing["return_utc_iso"],
@@ -342,7 +366,22 @@ def make_display_event_row(event_type, trial, raw_path, planned_duration_sec, pe
     }
 
 
-def run_trial_sequence(screen, trials, loaded_stim_raws, iti_raw, stim_raw_paths, iti_raw_path, event_log_path, gpio=None, include_final_iti=True):
+def run_trial_sequence(
+    screen,
+    trials,
+    loaded_stim_raws,
+    loaded_iti_raws=None,
+    stim_raw_paths=None,
+    iti_raw_paths=None,
+    event_log_path=None,
+    gpio=None,
+    include_final_iti=True,
+    **legacy_kwargs
+):
+    if loaded_iti_raws is None and "iti_raw" in legacy_kwargs:
+        loaded_iti_raws = legacy_kwargs["iti_raw"]
+    if iti_raw_paths is None and "iti_raw_path" in legacy_kwargs:
+        iti_raw_paths = legacy_kwargs["iti_raw_path"]
     playback_start = time.perf_counter()
     total_trials = len(trials)
     for trial_index, trial in enumerate(trials, start=1):
@@ -364,12 +403,19 @@ def run_trial_sequence(screen, trials, loaded_stim_raws, iti_raw, stim_raw_paths
 
         is_final_trial = trial_index == total_trials
         if include_final_iti or not is_final_trial:
+            iti_frames = int(trial.get("planned_iti_frames", iti_frame_bounds()[0]))
+            if isinstance(loaded_iti_raws, dict):
+                iti_raw = loaded_iti_raws[iti_frames]
+                iti_raw_path = iti_raw_paths[iti_frames]
+            else:
+                iti_raw = loaded_iti_raws
+                iti_raw_path = iti_raw_paths
             iti_perf, iti_timing = display_raw_with_timing(screen, iti_raw)
             iti_row = make_display_event_row(
                 "iti_on",
                 trial,
                 iti_raw_path,
-                ITI_DURATION_SEC,
+                trial.get("planned_iti_duration_sec", iti_duration_sec(iti_frames)),
                 iti_perf,
                 iti_timing,
             )
@@ -395,15 +441,19 @@ def build_iti_raw_cache(rpg_module, session_raw_dir):
     iti_dir = ensure_dir(session_raw_dir / "iti")
 
     iti_canvas = build_canvas(None, SCREEN_RESOLUTION, photodiode_on=False)
-    iti_raw_path = iti_dir / "gray_iti.raw"
-    convert_canvas_to_rpg_raw(rpg_module, iti_canvas, iti_raw_path, ITI_DURATION_SEC)
-    return iti_raw_path
+    iti_raw_paths = {}
+    minimum_frames, maximum_frames = iti_frame_bounds()
+    for iti_frames in range(minimum_frames, maximum_frames + 1):
+        iti_raw_path = iti_dir / ("gray_iti_%03df.raw" % iti_frames)
+        convert_canvas_to_rpg_raw(rpg_module, iti_canvas, iti_raw_path, iti_duration_sec(iti_frames))
+        iti_raw_paths[iti_frames] = iti_raw_path
+    return iti_raw_paths
 
 
 def build_session_raw_cache(rpg_module, session_raw_dir, selected_image_files):
     stim_raw_paths = build_stim_raw_cache(rpg_module, session_raw_dir, selected_image_files)
-    iti_raw_path = build_iti_raw_cache(rpg_module, session_raw_dir)
-    return stim_raw_paths, iti_raw_path
+    iti_raw_paths = build_iti_raw_cache(rpg_module, session_raw_dir)
+    return stim_raw_paths, iti_raw_paths
 
 def setup_gpio():
     if not USE_GPIO:
@@ -467,12 +517,13 @@ def format_seconds(seconds):
 
 
 def estimate_playback_seconds(total_trials):
-    return INITIAL_GRAY_SEC + FINAL_GRAY_SEC + total_trials * (STIM_DURATION_SEC + ITI_DURATION_SEC)
+    average_iti_sec = (ITI_MIN_SEC + ITI_MAX_SEC) / 2.0
+    return INITIAL_GRAY_SEC + FINAL_GRAY_SEC + total_trials * (STIM_DURATION_SEC + average_iti_sec)
 
 
 def print_progress(trial_number, total_trials, start_time):
     elapsed = time.perf_counter() - start_time
-    per_trial = STIM_DURATION_SEC + ITI_DURATION_SEC
+    per_trial = STIM_DURATION_SEC + (ITI_MIN_SEC + ITI_MAX_SEC) / 2.0
     remaining_trials = max(0, total_trials - trial_number)
     estimated_remaining = remaining_trials * per_trial + FINAL_GRAY_SEC
     percent = 100.0 if total_trials == 0 else (trial_number / float(total_trials)) * 100.0
@@ -500,7 +551,7 @@ def main():
     image_dir = resolve_image_dir()
     all_pngs = list_png_files(image_dir)
     selected_pngs = select_image_subset(all_pngs, n_images_to_use)
-    trials, sequence_seed = make_trial_sequence(selected_pngs, n_repeats)
+    trials, sequence_seed, iti_jitter_seed = make_trial_sequence(selected_pngs, n_repeats)
     estimated_playback_sec = estimate_playback_seconds(len(trials))
 
     print()
@@ -557,6 +608,7 @@ def main():
                 "image_path": trial["image_path"],
                 "repeat_number": trial["repeat_number"],
                 "planned_stim_duration_sec": trial["planned_stim_duration_sec"],
+                "planned_iti_frames": trial["planned_iti_frames"],
                 "planned_iti_duration_sec": trial["planned_iti_duration_sec"],
             }
             for trial in trials
@@ -569,6 +621,7 @@ def main():
             "image_path",
             "repeat_number",
             "planned_stim_duration_sec",
+            "planned_iti_frames",
             "planned_iti_duration_sec",
         ],
     )
@@ -588,11 +641,18 @@ def main():
         "n_images_to_use": n_images_to_use,
         "n_repeats": n_repeats,
         "image_subset_seed": IMAGE_SUBSET_SEED,
+        "resolved_image_subset_seed": IMAGE_SUBSET_SEED,
         "trial_order_seed": TRIAL_ORDER_SEED,
         "resolved_trial_order_seed": sequence_seed,
         "avoid_adjacent_repeats": AVOID_ADJACENT_REPEATS,
         "stim_duration_sec": STIM_DURATION_SEC,
-        "iti_duration_sec": ITI_DURATION_SEC,
+        "iti_mode": "uniform_discrete_frames",
+        "iti_min_sec": ITI_MIN_SEC,
+        "iti_max_sec": ITI_MAX_SEC,
+        "iti_min_frames": iti_frame_bounds()[0],
+        "iti_max_frames": iti_frame_bounds()[1],
+        "iti_jitter_seed": ITI_JITTER_SEED,
+        "resolved_iti_jitter_seed": iti_jitter_seed,
         "initial_gray_sec": INITIAL_GRAY_SEC,
         "final_gray_sec": FINAL_GRAY_SEC,
         "enable_photodiode_patch": ENABLE_PHOTODIODE_PATCH,
@@ -606,7 +666,7 @@ def main():
     metadata_path.write_text(json.dumps(metadata, indent=2, sort_keys=True) + chr(10))
 
     print("Preparing session raw files...")
-    stim_raw_paths, iti_raw_path = build_session_raw_cache(rpg, raw_cache_root, selected_pngs)
+    stim_raw_paths, iti_raw_paths = build_session_raw_cache(rpg, raw_cache_root, selected_pngs)
     print("Session raw files ready. Starting visual stimulus playback...")
     sys.stdout.flush()
     loaded_stim_raws = {}
@@ -623,7 +683,10 @@ def main():
 
             for image_path in selected_pngs:
                 loaded_stim_raws[image_path.stem] = screen.load_raw(str(stim_raw_paths[image_path.stem]))
-            iti_raw = screen.load_raw(str(iti_raw_path))
+            loaded_iti_raws = {
+                iti_frames: screen.load_raw(str(iti_raw_path))
+                for iti_frames, iti_raw_path in iti_raw_paths.items()
+            }
 
             append_csv_row(
                 event_log_path,
@@ -641,9 +704,9 @@ def main():
                 screen,
                 trials,
                 loaded_stim_raws,
-                iti_raw,
+                loaded_iti_raws,
                 stim_raw_paths,
-                iti_raw_path,
+                iti_raw_paths,
                 event_log_path,
                 gpio=gpio if USE_GPIO else None,
             )

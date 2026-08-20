@@ -431,7 +431,8 @@ def prestimulus_result_message(baseline_result):
 
 
 def run_poststim_black_baseline(screen, iti_raw, event_log_path, stimulus_playback_completed=True):
-    final_gray_repeats = max(1, int(math.ceil(base.POSTSTIM_GRAY_PLANNED_SEC / base.ITI_DURATION_SEC)))
+    baseline_iti_sec = base.iti_duration_sec(base.iti_frame_bounds()[1])
+    final_gray_repeats = max(1, int(math.ceil(base.POSTSTIM_GRAY_PLANNED_SEC / baseline_iti_sec)))
     poststim_gray_start_utc = base.utc_iso_now()
     base.append_csv_row(
         event_log_path,
@@ -887,7 +888,7 @@ def main():
     image_dir = base.resolve_image_dir()
     all_pngs = base.list_png_files(image_dir)
     selected_pngs = base.select_image_subset(all_pngs, n_images_to_use)
-    trials, sequence_seed = base.make_trial_sequence(selected_pngs, n_repeats)
+    trials, sequence_seed, iti_jitter_seed = base.make_trial_sequence(selected_pngs, n_repeats)
     estimated_playback_sec = base.estimate_playback_seconds(len(trials))
 
     print()
@@ -952,6 +953,7 @@ def main():
                 "image_path": trial["image_path"],
                 "repeat_number": trial["repeat_number"],
                 "planned_stim_duration_sec": trial["planned_stim_duration_sec"],
+                "planned_iti_frames": trial["planned_iti_frames"],
                 "planned_iti_duration_sec": trial["planned_iti_duration_sec"],
             }
             for trial in trials
@@ -964,6 +966,7 @@ def main():
             "image_path",
             "repeat_number",
             "planned_stim_duration_sec",
+            "planned_iti_frames",
             "planned_iti_duration_sec",
         ],
     )
@@ -983,11 +986,18 @@ def main():
         "n_images_to_use": n_images_to_use,
         "n_repeats": n_repeats,
         "image_subset_seed": base.IMAGE_SUBSET_SEED,
+        "resolved_image_subset_seed": base.IMAGE_SUBSET_SEED,
         "trial_order_seed": base.TRIAL_ORDER_SEED,
         "resolved_trial_order_seed": sequence_seed,
         "avoid_adjacent_repeats": base.AVOID_ADJACENT_REPEATS,
         "stim_duration_sec": base.STIM_DURATION_SEC,
-        "iti_duration_sec": base.ITI_DURATION_SEC,
+        "iti_mode": "uniform_discrete_frames",
+        "iti_min_sec": base.ITI_MIN_SEC,
+        "iti_max_sec": base.ITI_MAX_SEC,
+        "iti_min_frames": base.iti_frame_bounds()[0],
+        "iti_max_frames": base.iti_frame_bounds()[1],
+        "iti_jitter_seed": base.ITI_JITTER_SEED,
+        "resolved_iti_jitter_seed": iti_jitter_seed,
         "initial_gray_sec": base.INITIAL_GRAY_SEC,
         "final_gray_sec": base.FINAL_GRAY_SEC,
         "enable_photodiode_patch": base.ENABLE_PHOTODIODE_PATCH,
@@ -1057,13 +1067,19 @@ def main():
     gpio = None
 
     try:
-        iti_raw_path = base.build_iti_raw_cache(rpg, raw_cache_root)
+        iti_raw_paths = base.build_iti_raw_cache(rpg, raw_cache_root)
+        baseline_iti_frames = base.iti_frame_bounds()[1]
+        iti_raw_path = iti_raw_paths[baseline_iti_frames]
         if base.USE_GPIO:
             gpio = base.setup_gpio()
 
         try:
             with rpg.Screen(base.SCREEN_RESOLUTION, background=base.SCREEN_BACKGROUND_GRAY, colormode=base.SCREEN_COLORMODE) as screen:
-                iti_raw = screen.load_raw(str(iti_raw_path))
+                loaded_iti_raws = {
+                    iti_frames: screen.load_raw(str(raw_path))
+                    for iti_frames, raw_path in iti_raw_paths.items()
+                }
+                iti_raw = loaded_iti_raws[baseline_iti_frames]
                 prestim_gray_start_monotonic = time.monotonic()
                 baseline_perf, baseline_timing = base.display_raw_with_timing(screen, iti_raw)
                 prestim_gray_on_utc = baseline_timing["request_utc_iso"]
@@ -1074,7 +1090,7 @@ def main():
                     {
                         "event_type": "prestim_gray_on",
                         "raw_path": str(iti_raw_path),
-                        "planned_duration_sec": base.ITI_DURATION_SEC,
+                        "planned_duration_sec": base.iti_duration_sec(baseline_iti_frames),
                         "display_request_unix_ns": baseline_timing["request_unix_ns"],
                         "display_return_unix_ns": baseline_timing["return_unix_ns"],
                         "display_return_utc_iso": baseline_timing["return_utc_iso"],
@@ -1238,9 +1254,9 @@ def main():
                     screen,
                     trials,
                     loaded_stim_raws,
-                    iti_raw,
-                    stim_raw_paths,
-                    iti_raw_path,
+                loaded_iti_raws,
+                stim_raw_paths,
+                iti_raw_paths,
                     event_log_path,
                     gpio=gpio if base.USE_GPIO else None,
                     include_final_iti=False,

@@ -173,11 +173,13 @@ class PrestimBaselineTests(unittest.TestCase):
                 )
 
         self.assertEqual(set(stim_paths.keys()), {"img_001", "img_002"})
-        self.assertEqual(Path(iti_path).name, "gray_iti.raw")
-        self.assertEqual(Path(combined_iti_path).name, "gray_iti.raw")
+        self.assertEqual(set(iti_path), set(range(42, 61)))
+        self.assertEqual(set(combined_iti_path), set(range(42, 61)))
+        self.assertEqual(Path(iti_path[42]).name, "gray_iti_042f.raw")
+        self.assertEqual(Path(combined_iti_path[60]).name, "gray_iti_060f.raw")
         self.assertEqual(set(combined_stim_paths.keys()), {"img_001", "img_002"})
         self.assertEqual([name for name, _ in convert_calls[:2]], ["img_001.raw", "img_002.raw"])
-        self.assertEqual(convert_calls[2][0], "gray_iti.raw")
+        self.assertEqual(convert_calls[2][0], "gray_iti_042f.raw")
 
     def test_wait_for_prestimulus_gate_timer_elapsed_and_gray_elapsed(self):
         clock = FakeClock(5.0)

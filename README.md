@@ -20,7 +20,7 @@ What the runtime does:
 - chooses a reproducible subset of Stringer center-crop PNGs
 - bakes session-specific `rpg` raw files at startup
 - displays each image fullscreen for a fixed duration
-- shows gray ITI between images
+- shows a uniformly jittered gray ITI between images, sampled in whole display frames
 - prints a terminal progress line with percent and ETA during playback
 - optionally bakes a photodiode patch into the frames
 - logs display-request timestamps for `stim_on` and `iti_on` while the photodiode remains the ground truth for physical onset
@@ -32,7 +32,7 @@ What the runtime does:
 The current default stimulus timing is:
 
 - image on-screen time: `0.5` seconds
-- ITI time: `0.75` seconds
+- image-to-image ITI: uniformly sampled from `0.7` to `1.0` seconds, inclusive, in whole frames (`42` to `60` frames at 60 Hz)
 - initial gray screen: `3.0` seconds
 - final gray screen: `3.0` seconds
 
@@ -123,6 +123,17 @@ ENABLE_PHOTODIODE_PATCH = True
 ```
 
 The helper functions already bake the patch into the session raw files.
+
+## Randomization and timing records
+
+Image selection, trial order, and ITI jitter use independent random-number
+generators. The resolved seeds are written to the session metadata. The
+planned-sequence CSV records `planned_stim_duration_sec`,
+`planned_iti_frames`, and `planned_iti_duration_sec` for every trial, and the
+event log records the same planned ITI for each `iti_on` event.
+
+Only the 19 possible ITI raw files are cached per session:
+`gray_iti_042f.raw` through `gray_iti_060f.raw`.
 
 ## Notes on the display backend
 

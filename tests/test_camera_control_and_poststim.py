@@ -298,8 +298,8 @@ class CameraControlAndPoststimTests(unittest.TestCase):
         ):
             result = cam.run_poststim_black_baseline(screen, "iti_raw", Path("/tmp/event_log.csv"))
 
-        self.assertEqual(screen.calls[:4], [("display_raw", "iti_raw"), ("display_raw", "iti_raw"), ("display_raw", "iti_raw"), ("display_raw", "iti_raw")])
-        self.assertEqual(screen.calls[4], ("display_greyscale", base.POSTSTIM_BLACK_LEVEL))
+        self.assertEqual(screen.calls[:3], [("display_raw", "iti_raw"), ("display_raw", "iti_raw"), ("display_raw", "iti_raw")])
+        self.assertEqual(screen.calls[3], ("display_greyscale", base.POSTSTIM_BLACK_LEVEL))
         self.assertEqual(stop_calls, ["stop"])
         self.assertEqual(fetch_calls, ["fetch"])
         self.assertEqual(event_types, [
