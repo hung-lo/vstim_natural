@@ -68,6 +68,7 @@ CAMERA_OUTPUT_MIN_BYTES = 1
 CAMERA_OUTPUT_GLOB = "*.h264"
 CAMERA_RAW_VIDEO_PATTERNS = ("*.h264",)
 CAMERA_RSYNC_TIMEOUT_SEC = 300.0
+CAMERA_MANIFEST_TIMEOUT_SEC = 300.0
 CAMERA_FFMPEG_TIMEOUT_SEC = 600.0
 CAMERA_MP4_FASTSTART = False
 CAMERA_FFPROBE_TIMEOUT_SEC = 30.0
@@ -88,6 +89,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent
 STATE_FILE = LOCAL_VIDEO_ROOT / ".vstim_natural_camera_session.json"
 GENERIC_STATE_FILE = LOCAL_VIDEO_ROOT / ".last_remote_camera_session.json"
 LEGACY_STATE_FILE = PROJECT_ROOT / "stim_logs" / ".last_remote_camera_session.json"
+VIDEO_MANIFEST_FILENAME = "video_manifest.json"
 
 
 class CameraStateError(RuntimeError):
@@ -446,6 +448,7 @@ def run_rsync(camera_host, remote_dir, local_dir, dry_run=False, timeout_sec=CAM
             "-av",
             "--progress",
             "--partial",
+            "--append-verify",
             "--timeout=30",
             f"{camera_host}:{remote_dir.rstrip('/')}/",
             str(local_dir) + "/",
@@ -504,7 +507,7 @@ def fetch_remote_camera_manifest(camera_host, remote_video_dir, dry_run=False):
         camera_host,
         build_remote_camera_manifest_command(remote_video_dir),
         dry_run=dry_run,
-        timeout=CAMERA_RSYNC_TIMEOUT_SEC,
+        timeout=CAMERA_MANIFEST_TIMEOUT_SEC,
     )
     manifest = parse_camera_manifest(result.stdout)
     if (result.stdout or "").strip() and not manifest:
@@ -599,11 +602,21 @@ def delete_remote_camera_raw_files(
         command = "rm -f -- " + " ".join(shlex.quote(entry["path"]) for entry in fresh_manifest)
         run_ssh(camera_host, command, dry_run=dry_run, timeout=CAMERA_RSYNC_TIMEOUT_SEC)
     return {
+        "remote_raw_cleanup_attempted": True,
         "remote_raw_cleanup_completed": True,
         "remote_raw_retained": False,
         "remote_raw_cleanup_error": "",
         "remote_raw_cleanup_manifest": fresh_manifest,
     }
+
+
+def saved_camera_raw_manifest(state):
+    manifest = state.get("camera_raw_manifest") or state.get("remote_raw_manifest")
+    if not manifest:
+        raise CameraStateSchemaError(
+            "Saved camera state does not contain a verified camera_raw_manifest; refusing recovery conversion."
+        )
+    return manifest
 
 
 def find_local_camera_raw_files(local_video_dir):
@@ -1252,27 +1265,76 @@ def append_event(local_video_dir, event, details=None):
         writer.writerow(row)
 
 
-def save_state(state):
-    STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+def atomic_write_json(path, payload):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
     temporary_path = None
     try:
         with tempfile.NamedTemporaryFile(
             mode="w",
             encoding="utf-8",
-            dir=str(STATE_FILE.parent),
-            prefix=".%s." % STATE_FILE.name,
+            dir=str(path.parent),
+            prefix=".%s." % path.name,
             suffix=".tmp",
             delete=False,
         ) as handle:
             temporary_path = Path(handle.name)
-            json.dump(state, handle, indent=2, sort_keys=True)
+            json.dump(payload, handle, indent=2, sort_keys=True)
             handle.write("\n")
             handle.flush()
             os.fsync(handle.fileno())
-        os.replace(str(temporary_path), str(STATE_FILE))
+        os.replace(str(temporary_path), str(path))
     finally:
         if temporary_path is not None and temporary_path.exists():
             temporary_path.unlink()
+
+
+def write_video_manifest(state):
+    """Write the per-session archival integrity projection atomically."""
+    local_video_dir_value = state.get("local_video_dir")
+    if not local_video_dir_value:
+        return None
+    local_video_dir = Path(local_video_dir_value)
+
+    try:
+        local_raw_manifest = local_camera_manifest(local_video_dir)
+    except (OSError, ValueError):
+        local_raw_manifest = []
+
+    conversion_result = state.get("conversion_result") or {}
+    manifest = {
+        "session_id": state.get("session_id"),
+        "camera_host": state.get("camera_host"),
+        "remote_video_dir": state.get("remote_video_dir"),
+        "remote_raw_manifest": state.get("camera_raw_manifest")
+        or state.get("remote_raw_manifest_before_transfer")
+        or [],
+        "local_raw_manifest": local_raw_manifest,
+        "camera_raw_files_verified": bool(state.get("camera_raw_files_verified")),
+        "camera_raw_hash_verified": bool(state.get("camera_raw_hash_verified")),
+        "camera_mp4_verified": bool(state.get("camera_mp4_verified")),
+        "converted_mp4_files": state.get("converted_mp4_files") or [],
+        "ffprobe_validation_results": state.get("ffprobe_validation_results")
+        or conversion_result.get("conversion_attempts")
+        or [],
+        "camera_transfer_command_completed": bool(state.get("camera_transfer_command_completed")),
+        "camera_fetch_completed": bool(state.get("camera_fetch_completed")),
+        "camera_conversion_completed": bool(state.get("camera_conversion_completed")),
+        "remote_raw_cleanup_attempted": bool(state.get("remote_raw_cleanup_attempted")),
+        "remote_raw_cleanup_completed": bool(state.get("remote_raw_cleanup_completed")),
+        "remote_raw_retained": bool(state.get("remote_raw_retained", True)),
+        "remote_raw_cleanup_error": state.get("remote_raw_cleanup_error", ""),
+        "updated_utc": utc_iso_now(),
+    }
+    manifest_path = local_video_dir / VIDEO_MANIFEST_FILENAME
+    atomic_write_json(manifest_path, manifest)
+    return manifest_path
+
+
+def save_state(state):
+    STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    atomic_write_json(STATE_FILE, state)
+    write_video_manifest(state)
     print("Saved state: %s" % STATE_FILE)
 
 
@@ -1366,6 +1428,10 @@ def build_state_from_args(args):
         "camera_start_requested_utc": None,
         "camera_start_confirmed_utc": None,
         "camera_stop_confirmed_utc": None,
+        "camera_fetch_status": "not_started",
+        "remote_raw_cleanup_attempted": False,
+        "remote_raw_cleanup_completed": False,
+        "remote_raw_retained": True,
         **paths,
     }
 
@@ -1436,6 +1502,10 @@ def start_camera(args):
         "camera_output_growth_confirmed_utc": None,
         "camera_start_confirmed_utc": None,
         "camera_stop_confirmed_utc": None,
+        "camera_fetch_status": "not_started",
+        "remote_raw_cleanup_attempted": False,
+        "remote_raw_cleanup_completed": False,
+        "remote_raw_retained": True,
         **paths,
     }
 
@@ -1739,15 +1809,26 @@ def preview_camera(args):
     run_ssh(camera_host, preview_cmd, dry_run=args.dry_run, timeout=CAMERA_PREVIEW_LAUNCH_TIMEOUT_SEC)
     print("Preview started. Type y and Enter to stop it.")
     if not args.dry_run:
+        preview_error = None
         while True:
             try:
                 response = input("> ").strip().lower()
-            except EOFError:
-                response = "y"
+            except EOFError as exc:
+                preview_error = RuntimeError(
+                    "Preview input ended at EOF; preview was stopped without treating EOF as confirmation."
+                )
+                break
             if response == "y":
                 break
             print("Preview still running. Type y and Enter to stop.")
-        run_ssh(camera_host, stop_cmd, dry_run=args.dry_run, timeout=CAMERA_PREVIEW_STOP_TIMEOUT_SEC)
+        try:
+            run_ssh(camera_host, stop_cmd, dry_run=args.dry_run, timeout=CAMERA_PREVIEW_STOP_TIMEOUT_SEC)
+        except Exception as cleanup_exc:
+            if preview_error is not None:
+                raise RuntimeError("Preview input ended and controlled preview cleanup failed: %s" % cleanup_exc) from preview_error
+            raise
+        if preview_error is not None:
+            raise preview_error
         print("Preview stopped.")
     else:
         print("Dry run finished; preview was not actually started.")
@@ -1778,6 +1859,42 @@ def convert_camera(args, state=None):
             "ffmpeg_timeout_sec": getattr(args, "ffmpeg_timeout_sec", CAMERA_FFMPEG_TIMEOUT_SEC),
         },
     )
+
+    def record_integrity_failure(error):
+        state["camera_raw_files_verified"] = False
+        state["camera_raw_hash_verified"] = False
+        state["camera_conversion_completed"] = False
+        state["camera_conversion_deferred"] = True
+        state["camera_mp4_verified"] = False
+        state["camera_conversion_failed"] = True
+        state["camera_conversion_failed_utc"] = utc_iso_now()
+        state["camera_conversion_error"] = str(error)
+        state["remote_raw_retained"] = True
+        state["remote_raw_cleanup_completed"] = bool(state.get("remote_raw_cleanup_completed"))
+        save_state(state)
+        append_event(
+            local_video_dir,
+            "camera_conversion_integrity_failed",
+            {
+                "camera_host": camera_host,
+                "local_video_dir": str(local_video_dir),
+                "error": str(error),
+                "remote_raw_retained": True,
+            },
+        )
+        print("Camera raw integrity verification failed; MP4 conversion and remote cleanup were not run.", file=sys.stderr)
+        return state
+
+    try:
+        raw_manifest = saved_camera_raw_manifest(state)
+        verify_raw_manifest(local_video_dir, raw_manifest)
+    except Exception as exc:
+        return record_integrity_failure(exc)
+
+    state["camera_raw_files_verified"] = True
+    state["camera_raw_hash_verified"] = True
+    state["camera_raw_manifest"] = raw_manifest
+    save_state(state)
 
     try:
         conversion_state = run_camera_conversion_workflow(
@@ -1814,6 +1931,43 @@ def convert_camera(args, state=None):
     state["camera_conversion_failed_utc"] = ""
     state["camera_mp4_verified"] = bool(conversion_state.get("camera_mp4_verified"))
     state["camera_conversion_deferred"] = not state["camera_mp4_verified"]
+    state["remote_raw_retained"] = not bool(state.get("remote_raw_cleanup_completed"))
+
+    if state["camera_mp4_verified"] and not state.get("remote_raw_cleanup_completed"):
+        state["remote_raw_cleanup_attempted"] = True
+        save_state(state)
+        try:
+            cleanup_state = delete_remote_camera_raw_files(
+                camera_host,
+                state["remote_video_dir"],
+                local_video_dir,
+                raw_manifest,
+                dry_run=args.dry_run,
+            )
+            state.update(cleanup_state)
+        except Exception as exc:
+            state["remote_raw_cleanup_completed"] = False
+            state["remote_raw_retained"] = True
+            state["remote_raw_cleanup_error"] = str(exc)
+            save_state(state)
+            append_event(
+                local_video_dir,
+                "remote_raw_cleanup_failed",
+                {
+                    "camera_host": camera_host,
+                    "remote_video_dir": state["remote_video_dir"],
+                    "error": str(exc),
+                    "raw_h264_retained": True,
+                },
+            )
+            raise
+
+    state["camera_data_secured"] = bool(
+        state.get("camera_stop_confirmed")
+        and state.get("camera_raw_hash_verified")
+        and state.get("camera_mp4_verified")
+        and state.get("remote_raw_cleanup_completed")
+    )
     save_state(state)
     if conversion_state.get("camera_conversion_completed"):
         print("Converted camera files in: %s" % local_video_dir)
@@ -1833,23 +1987,79 @@ def fetch_camera(args, state=None):
     else:
         state = validate_camera_state(state, "in-memory state")
 
-    camera_host = resolve_camera_host(args, state)
     remote_video_dir = state["remote_video_dir"]
     local_video_dir = Path(state["local_video_dir"])
     local_video_dir.mkdir(parents=True, exist_ok=True)
-    prior_raw_hash_verified = bool(state.get("camera_raw_hash_verified"))
-    prior_remote_cleanup_completed = bool(state.get("remote_raw_cleanup_completed"))
+
+    # Once remote cleanup succeeded, the local manifest is the only safe
+    # recovery source; avoid touching the camera Pi again.
+    if state.get("remote_raw_cleanup_completed") and state.get("camera_raw_manifest"):
+        try:
+            raw_manifest = saved_camera_raw_manifest(state)
+            verify_raw_manifest(local_video_dir, raw_manifest)
+            ffprobe_results = validate_local_mp4_files(local_video_dir, raw_manifest)
+        except Exception as exc:
+            state["camera_fetch_status"] = "integrity_failed_after_cleanup"
+            state["camera_fetch_completed"] = False
+            state["camera_raw_files_verified"] = False
+            state["camera_raw_hash_verified"] = False
+            state["camera_conversion_completed"] = False
+            state["camera_conversion_deferred"] = True
+            state["camera_mp4_verified"] = False
+            state["camera_fetch_error"] = str(exc)
+            state["remote_raw_retained"] = False
+            save_state(state)
+            append_event(
+                local_video_dir,
+                "camera_fetch_integrity_failed_after_cleanup",
+                {
+                    "error": str(exc),
+                    "remote_raw_cleanup_completed": True,
+                    "remote_raw_retained": False,
+                },
+            )
+            raise RuntimeError(
+                "Remote raw files were already cleaned up, but the local camera archive no longer matches its saved manifest: %s"
+                % exc
+            ) from exc
+
+        state["camera_fetch_status"] = "already_secured"
+        state["camera_transfer_command_completed"] = True
+        state["camera_fetch_completed"] = True
+        state["camera_raw_files_verified"] = True
+        state["camera_raw_hash_verified"] = True
+        state["camera_raw_file_count"] = len(raw_manifest)
+        state["camera_conversion_completed"] = True
+        state["camera_conversion_deferred"] = False
+        state["camera_mp4_verified"] = True
+        state["ffprobe_validation_results"] = ffprobe_results
+        state["remote_raw_cleanup_completed"] = True
+        state["remote_raw_retained"] = False
+        state["camera_fetch_error"] = ""
+        state["camera_data_secured"] = bool(
+            state.get("camera_stop_confirmed")
+            and state.get("camera_raw_hash_verified")
+            and state.get("camera_mp4_verified")
+            and state.get("remote_raw_cleanup_completed")
+        )
+        save_state(state)
+        print("Camera files are already secured locally; no remote transfer was needed.")
+        return state
+
+    camera_host = resolve_camera_host(args, state)
     state["camera_transfer_command_completed"] = False
     state["camera_fetch_completed"] = False
     state["camera_conversion_attempted"] = False
     state["camera_conversion_completed"] = False
     state["camera_conversion_deferred"] = False
     state["camera_fetch_timed_out"] = False
+    state["camera_fetch_status"] = "requested"
     state["camera_raw_files_verified"] = False
     state["camera_raw_hash_verified"] = False
     state["raw_h264_available_locally"] = False
     state["converted_mp4_files"] = []
     state["remote_raw_cleanup_completed"] = False
+    state["remote_raw_cleanup_attempted"] = False
     state["remote_raw_retained"] = True
     save_state(state)
 
@@ -1883,6 +2093,9 @@ def fetch_camera(args, state=None):
         state["camera_fetch_error"] = str(exc)
         if "timed out" in str(exc).lower():
             state["camera_fetch_timed_out"] = True
+        if "manifest" in str(exc).lower() or "sha" in str(exc).lower():
+            state["remote_raw_cleanup_deferred"] = True
+            state["remote_raw_retained"] = True
         append_event(
             local_video_dir,
             "camera_fetch_failed",
@@ -1908,16 +2121,15 @@ def fetch_camera(args, state=None):
             verify_raw_manifest(local_video_dir, remote_manifest_after)
             state["camera_raw_hash_verified"] = True
             state["camera_raw_manifest"] = remote_manifest_after
-        elif prior_raw_hash_verified and prior_remote_cleanup_completed:
-            verify_local_camera_raw_files(local_video_dir)
-            state["camera_raw_hash_verified"] = True
-            state["camera_raw_manifest"] = state.get("camera_raw_manifest", [])
         else:
             raise RuntimeError("Remote camera manifest is empty and no prior raw verification is recorded.")
     except Exception as exc:
         state["camera_fetch_failed"] = True
         state["camera_fetch_failed_utc"] = utc_iso_now()
         state["camera_fetch_error"] = str(exc)
+        if "manifest" in str(exc).lower() or "sha" in str(exc).lower():
+            state["remote_raw_cleanup_deferred"] = True
+            state["remote_raw_retained"] = True
         append_event(
             local_video_dir,
             "camera_raw_verification_failed",
@@ -1936,6 +2148,7 @@ def fetch_camera(args, state=None):
     state["camera_raw_files_verified"] = True
     state["camera_raw_file_count"] = len(find_local_camera_raw_files(local_video_dir))
     state["camera_fetch_returned_utc"] = utc_iso_now()
+    state["camera_fetch_status"] = "transferred"
     save_state(state)
     append_event(
         local_video_dir,
@@ -1996,12 +2209,10 @@ def fetch_camera(args, state=None):
     state["camera_conversion_skip_reason"] = conversion_state.get("camera_conversion_skip_reason", "")
     state["converted_mp4_files"] = conversion_state.get("converted_mp4_files", [])
     state["camera_mp4_verified"] = bool(conversion_state.get("camera_mp4_verified"))
+    state["ffprobe_validation_results"] = conversion_state.get("conversion_attempts", [])
     state["remote_raw_retained"] = True
-    if prior_remote_cleanup_completed and not remote_manifest_before:
-        state["remote_raw_cleanup_completed"] = True
-        state["remote_raw_retained"] = False
-        state["remote_raw_cleanup_error"] = ""
-    elif state["camera_raw_hash_verified"] and state["camera_mp4_verified"]:
+    if state["camera_raw_hash_verified"] and state["camera_mp4_verified"]:
+        state["remote_raw_cleanup_attempted"] = True
         try:
             cleanup_state = delete_remote_camera_raw_files(
                 camera_host,
@@ -2027,6 +2238,13 @@ def fetch_camera(args, state=None):
             )
             save_state(state)
             raise
+    state["camera_fetch_status"] = "secured" if state.get("remote_raw_cleanup_completed") else "deferred"
+    state["camera_data_secured"] = bool(
+        state.get("camera_stop_confirmed")
+        and state.get("camera_raw_hash_verified")
+        and state.get("camera_mp4_verified")
+        and state.get("remote_raw_cleanup_completed")
+    )
     save_state(state)
     print("Fetched camera files to: %s" % local_video_dir)
     return state

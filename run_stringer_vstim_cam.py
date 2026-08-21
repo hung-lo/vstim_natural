@@ -530,6 +530,7 @@ def run_poststim_black_baseline(screen, iti_raw, event_log_path, stimulus_playba
     camera_conversion_completed = False
     camera_conversion_deferred = False
     camera_fetch_deferred = False
+    latest_camera_state = {}
     poststim_camera_stop_requested_utc = ""
     poststim_camera_stop_confirmed_utc = ""
     poststim_black_ended_after_fetch = False
@@ -610,7 +611,9 @@ def run_poststim_black_baseline(screen, iti_raw, event_log_path, stimulus_playba
         while not camera_stop_confirmed and not camera_left_running_by_user:
             record_stop_request(reason)
             try:
-                stop_camera_recording()
+                stop_state = stop_camera_recording()
+                if isinstance(stop_state, dict):
+                    latest_camera_state.update(stop_state)
                 camera_stop_confirmed = True
                 record_stop_confirmed(reason)
                 break
@@ -686,6 +689,8 @@ def run_poststim_black_baseline(screen, iti_raw, event_log_path, stimulus_playba
             try:
                 time.sleep(2.0)
                 fetch_result = fetch_camera_recording()
+                if isinstance(fetch_result, dict):
+                    latest_camera_state.update(fetch_result)
                 camera_fetch_completed = bool(fetch_result.get("camera_fetch_completed"))
                 camera_conversion_started = True
                 camera_conversion_completed = bool(fetch_result.get("camera_conversion_completed"))
@@ -749,6 +754,8 @@ def run_poststim_black_baseline(screen, iti_raw, event_log_path, stimulus_playba
                     try:
                         time.sleep(2.0)
                         convert_result = convert_camera_recording()
+                        if isinstance(convert_result, dict):
+                            latest_camera_state.update(convert_result)
                         camera_conversion_completed = bool(convert_result.get("camera_conversion_completed"))
                         camera_conversion_deferred = bool(convert_result.get("camera_conversion_deferred"))
                         if camera_conversion_completed:
@@ -851,6 +858,49 @@ def run_poststim_black_baseline(screen, iti_raw, event_log_path, stimulus_playba
     if not (camera_stop_confirmed or camera_left_running_by_user):
         raise RuntimeError("Post-stimulus cleanup invariant violated: camera state unresolved")
 
+    if camera_left_running_by_user:
+        latest_camera_state.update(
+            {
+                "camera_left_running_by_user": True,
+                "camera_stop_confirmed": False,
+                "camera_fetch_completed": False,
+                "camera_conversion_completed": False,
+                "camera_mp4_verified": False,
+                "remote_raw_cleanup_completed": False,
+                "remote_raw_retained": True,
+            }
+        )
+
+    structured_camera_fields = {
+        "camera_stop_confirmed": bool(latest_camera_state.get("camera_stop_confirmed", camera_stop_confirmed)),
+        "camera_fetch_status": latest_camera_state.get("camera_fetch_status", ""),
+        "camera_transfer_command_completed": bool(latest_camera_state.get("camera_transfer_command_completed")),
+        "camera_fetch_completed": bool(latest_camera_state.get("camera_fetch_completed", camera_fetch_completed)),
+        "camera_raw_files_verified": bool(latest_camera_state.get("camera_raw_files_verified")),
+        "camera_raw_hash_verified": bool(latest_camera_state.get("camera_raw_hash_verified")),
+        "camera_raw_file_count": latest_camera_state.get("camera_raw_file_count", 0),
+        "camera_conversion_completed": bool(
+            latest_camera_state.get("camera_conversion_completed", camera_conversion_completed)
+        ),
+        "camera_conversion_deferred": bool(
+            latest_camera_state.get("camera_conversion_deferred", camera_conversion_deferred)
+        ),
+        "camera_mp4_verified": bool(latest_camera_state.get("camera_mp4_verified")),
+        "remote_raw_cleanup_attempted": bool(latest_camera_state.get("remote_raw_cleanup_attempted")),
+        "remote_raw_cleanup_completed": bool(latest_camera_state.get("remote_raw_cleanup_completed")),
+        "remote_raw_cleanup_error": latest_camera_state.get("remote_raw_cleanup_error", ""),
+        "remote_raw_retained": bool(latest_camera_state.get("remote_raw_retained", True)),
+        "camera_fetch_error": latest_camera_state.get("camera_fetch_error", ""),
+        "camera_conversion_error": latest_camera_state.get("camera_conversion_error", ""),
+        "camera_left_running_by_user": camera_left_running_by_user,
+    }
+    structured_camera_fields["camera_data_secured"] = bool(
+        structured_camera_fields["camera_stop_confirmed"]
+        and structured_camera_fields["camera_raw_hash_verified"]
+        and structured_camera_fields["camera_mp4_verified"]
+        and structured_camera_fields["remote_raw_cleanup_completed"]
+    )
+
     poststim_black_actual_sec = time.monotonic() - poststim_black_start_monotonic
     base.append_csv_row(
         event_log_path,
@@ -906,10 +956,12 @@ def run_poststim_black_baseline(screen, iti_raw, event_log_path, stimulus_playba
         "camera_conversion_deferred": camera_conversion_deferred,
         "camera_fetch_deferred": camera_fetch_deferred,
         "session_completed": session_completed,
+        "session_completed_semantics": "stimulus_playback_completed_and_camera_stop_confirmed",
         "poststim_screen_remained_open": True,
         "poststim_screen_remains_open_during_stop": True,
         "poststim_screen_remains_open_during_fetch": True,
         "poststim_visual_condition": "black_grayscale_0",
+        **structured_camera_fields,
     }
 
 
@@ -1411,6 +1463,33 @@ def main():
         metadata["camera_left_running_by_user"] = poststim_result["camera_left_running_by_user"] if poststim_result else False
         metadata["camera_fetch_started"] = poststim_result["camera_fetch_started"] if poststim_result else False
         metadata["camera_session_id"] = session_id if camera_started else ""
+        metadata["session_completed_semantics"] = (
+            poststim_result.get("session_completed_semantics", "stimulus_playback_completed_and_camera_stop_confirmed")
+            if poststim_result
+            else "stimulus_playback_completed_and_camera_stop_confirmed"
+        )
+        metadata["camera_data_secured"] = poststim_result.get("camera_data_secured", False) if poststim_result else False
+        metadata_defaults = {
+            "camera_stop_confirmed": False,
+            "camera_fetch_status": "",
+            "camera_transfer_command_completed": False,
+            "camera_fetch_completed": False,
+            "camera_raw_files_verified": False,
+            "camera_raw_hash_verified": False,
+            "camera_raw_file_count": 0,
+            "camera_conversion_completed": False,
+            "camera_conversion_deferred": False,
+            "camera_mp4_verified": False,
+            "remote_raw_cleanup_attempted": False,
+            "remote_raw_cleanup_completed": False,
+            "remote_raw_cleanup_error": "",
+            "remote_raw_retained": True,
+            "camera_fetch_error": "",
+            "camera_conversion_error": "",
+            "camera_left_running_by_user": False,
+        }
+        for field, default in metadata_defaults.items():
+            metadata[field] = poststim_result.get(field, default) if poststim_result else default
         metadata["camera_start_requested_utc"] = camera_start_requested_utc
         metadata["camera_start_returned_utc"] = camera_start_returned_utc
         metadata["camera_start_confirmed_utc"] = camera_start_confirmed_utc

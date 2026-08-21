@@ -133,6 +133,22 @@ remote and local size/SHA-256 manifests, converts and strictly validates the
 on box 152. If transfer, conversion, validation, or cleanup fails, raw files
 are retained so `fetch` or `convert` can be retried safely.
 
+The transfer uses `--partial --append-verify` and has a separate long timeout
+for remote file listing and SHA-256 generation. Each session also contains a
+local `video/video_manifest.json` archival record. Standalone `convert` first
+rechecks the current local H.264 against the saved raw manifest and can finish
+the same exact-path remote cleanup after successful MP4 validation.
+
+After remote cleanup succeeds, a repeated `fetch` is local and idempotent: it
+re-hashes the local H.264 and revalidates the MP4 without SSH, rsync, or remote
+deletion. Preview input reaching EOF is treated as an abnormal condition; the
+preview is stopped, but EOF is not interpreted as typing `y`.
+
+`session_completed` means that stimulus playback completed and camera stop was
+confirmed. It does not by itself mean that camera data are fully archived.
+Use `camera_data_secured`, which additionally requires raw SHA-256 verification,
+MP4 validation, and confirmed remote raw cleanup.
+
 ## Photodiode patch
 
 The photodiode patch is built into the session raw files. The current default

@@ -762,5 +762,339 @@ class CameraControlAndPoststimTests(unittest.TestCase):
                     )
 
             run_mock.assert_not_called()
+
+    def test_rsync_uses_append_verify_without_source_deletion(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            captured = {}
+
+            def fake_run_cmd(cmd, **kwargs):
+                captured["cmd"] = cmd
+                return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+            with patch.object(rc, "run_cmd", side_effect=fake_run_cmd):
+                rc.run_rsync("pi@host", "/remote/video", Path(tmpdir))
+
+            self.assertIn("--partial", captured["cmd"])
+            self.assertIn("--append-verify", captured["cmd"])
+            self.assertNotIn("--remove-source-files", captured["cmd"])
+
+    def test_manifest_uses_dedicated_timeout(self):
+        captured = {}
+
+        def fake_run_ssh(host, command, **kwargs):
+            captured.update(kwargs)
+            return subprocess.CompletedProcess(["ssh"], 0, stdout="", stderr="")
+
+        with patch.object(rc, "run_ssh", side_effect=fake_run_ssh):
+            rc.fetch_remote_camera_manifest("pi@host", "/remote/video")
+
+        self.assertEqual(captured["timeout"], rc.CAMERA_MANIFEST_TIMEOUT_SEC)
+
+    def test_missing_remote_sha256_fails_safely_without_cleanup(self):
+        args = argparse.Namespace(dry_run=False, rsync_timeout_sec=1.0, ffmpeg_timeout_sec=1.0)
+        state = valid_camera_state(
+            remote_video_dir="/remote/session/video",
+            local_video_dir="/tmp/session/video",
+        )
+        with patch.object(rc, "fetch_remote_camera_manifest", side_effect=RuntimeError("remote sha256 unavailable")), patch.object(
+            rc, "run_rsync"
+        ) as rsync_mock, patch.object(rc, "save_state"), patch.object(rc, "append_event"), patch("builtins.print"):
+            with self.assertRaises(RuntimeError):
+                rc.fetch_camera(args, state)
+
+        self.assertFalse(state["camera_raw_files_verified"])
+        self.assertFalse(state["camera_raw_hash_verified"])
+        self.assertTrue(state["remote_raw_retained"])
+        self.assertTrue(state["remote_raw_cleanup_deferred"])
+        rsync_mock.assert_not_called()
+
+    def test_video_manifest_is_atomic_and_contains_integrity_fields(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            video_dir = root / "video"
+            video_dir.mkdir()
+            raw = video_dir / "session.h264"
+            raw.write_bytes(b"raw")
+            state = valid_camera_state(
+                local_session_dir=str(root),
+                local_video_dir=str(video_dir),
+                camera_raw_manifest=[{
+                    "path": "/remote/session/video/session.h264",
+                    "filename": "session.h264",
+                    "size_bytes": 3,
+                    "sha256": hashlib.sha256(b"raw").hexdigest(),
+                }],
+                camera_raw_files_verified=True,
+                camera_raw_hash_verified=True,
+                camera_mp4_verified=False,
+                camera_fetch_completed=True,
+                remote_raw_cleanup_attempted=False,
+                remote_raw_cleanup_completed=False,
+                remote_raw_retained=True,
+            )
+            state_path = root / ".vstim_natural_camera_session.json"
+            with patch.object(rc, "STATE_FILE", state_path):
+                rc.save_state(state)
+
+            manifest_path = video_dir / rc.VIDEO_MANIFEST_FILENAME
+            payload = json.loads(manifest_path.read_text())
+            self.assertEqual(payload["remote_raw_manifest"], state["camera_raw_manifest"])
+            self.assertEqual(payload["local_raw_manifest"][0]["sha256"], state["camera_raw_manifest"][0]["sha256"])
+            self.assertFalse(payload["camera_mp4_verified"])
+            self.assertTrue(payload["remote_raw_retained"])
+            self.assertFalse(list(video_dir.glob("*.tmp")))
+
+    def test_standalone_convert_rejects_modified_raw_despite_historical_hash_flag(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            video_dir = Path(tmpdir)
+            raw = video_dir / "session.h264"
+            raw.write_bytes(b"modified")
+            saved_digest = hashlib.sha256(b"original").hexdigest()
+            state = valid_camera_state(
+                local_video_dir=str(video_dir),
+                remote_video_dir="/remote/session/video",
+                camera_raw_manifest=[{
+                    "path": "/remote/session/video/session.h264",
+                    "filename": "session.h264",
+                    "size_bytes": len(b"original"),
+                    "sha256": saved_digest,
+                }],
+                camera_raw_hash_verified=True,
+                camera_stop_confirmed=True,
+            )
+            args = argparse.Namespace(dry_run=False, ffmpeg_timeout_sec=1.0)
+            with patch.object(rc, "save_state"), patch.object(rc, "append_event"), patch.object(
+                rc, "run_camera_conversion_workflow"
+            ) as conversion_mock, patch.object(rc, "delete_remote_camera_raw_files") as cleanup_mock:
+                result = rc.convert_camera(args, state)
+
+            self.assertFalse(result["camera_raw_files_verified"])
+            self.assertFalse(result["camera_raw_hash_verified"])
+            self.assertFalse(result["camera_conversion_completed"])
+            self.assertTrue(result["camera_conversion_deferred"])
+            self.assertFalse(result["camera_mp4_verified"])
+            self.assertTrue(result["camera_conversion_failed"])
+            conversion_mock.assert_not_called()
+            cleanup_mock.assert_not_called()
+
+    def test_standalone_convert_finishes_exact_remote_cleanup(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            video_dir = Path(tmpdir)
+            raw = video_dir / "session.h264"
+            raw.write_bytes(b"raw")
+            digest = hashlib.sha256(b"raw").hexdigest()
+            manifest = [{
+                "path": "/remote/session/video/session.h264",
+                "filename": "session.h264",
+                "size_bytes": 3,
+                "sha256": digest,
+            }]
+            state = valid_camera_state(
+                local_video_dir=str(video_dir),
+                remote_video_dir="/remote/session/video",
+                camera_raw_manifest=manifest,
+                camera_stop_confirmed=True,
+            )
+            args = argparse.Namespace(dry_run=False, ffmpeg_timeout_sec=1.0)
+            conversion = {
+                "camera_raw_files_verified": True,
+                "camera_raw_file_count": 1,
+                "raw_h264_available_locally": True,
+                "camera_conversion_attempted": True,
+                "camera_conversion_completed": True,
+                "camera_conversion_deferred": False,
+                "camera_conversion_error": "",
+                "camera_mp4_verified": True,
+                "converted_mp4_files": [str(video_dir / "session.mp4")],
+                "conversion_attempts": [],
+            }
+            cleanup = {
+                "remote_raw_cleanup_attempted": True,
+                "remote_raw_cleanup_completed": True,
+                "remote_raw_retained": False,
+                "remote_raw_cleanup_error": "",
+            }
+            with patch.object(rc, "save_state"), patch.object(rc, "append_event"), patch.object(
+                rc, "run_camera_conversion_workflow", return_value=conversion
+            ), patch.object(rc, "delete_remote_camera_raw_files", return_value=cleanup) as cleanup_mock:
+                result = rc.convert_camera(args, state)
+
+            cleanup_mock.assert_called_once()
+            self.assertTrue(result["camera_raw_hash_verified"])
+            self.assertTrue(result["camera_mp4_verified"])
+            self.assertTrue(result["remote_raw_cleanup_completed"])
+            self.assertFalse(result["remote_raw_retained"])
+
+    def test_repeated_fetch_is_local_only_after_successful_cleanup(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            video_dir = Path(tmpdir)
+            raw = video_dir / "session.h264"
+            mp4 = video_dir / "session.mp4"
+            raw.write_bytes(b"raw")
+            mp4.write_bytes(b"mp4")
+            manifest = [{
+                "path": "/remote/session/video/session.h264",
+                "filename": "session.h264",
+                "size_bytes": 3,
+                "sha256": hashlib.sha256(b"raw").hexdigest(),
+            }]
+            state = valid_camera_state(
+                local_video_dir=str(video_dir),
+                remote_video_dir="/remote/session/video",
+                camera_raw_manifest=manifest,
+                camera_raw_hash_verified=True,
+                camera_stop_confirmed=True,
+                remote_raw_cleanup_completed=True,
+                remote_raw_retained=False,
+            )
+            args = argparse.Namespace(dry_run=False, rsync_timeout_sec=1.0, ffmpeg_timeout_sec=1.0)
+            valid_mp4 = {"validation_available": True, "valid": True, "size_bytes": 3, "error": ""}
+            with patch.object(rc, "save_state"), patch.object(rc, "append_event"), patch.object(
+                rc, "validate_mp4_with_ffprobe", return_value=valid_mp4
+            ), patch.object(rc, "fetch_remote_camera_manifest") as manifest_mock, patch.object(
+                rc, "run_rsync"
+            ) as rsync_mock, patch.object(rc, "run_ssh") as ssh_mock:
+                result = rc.fetch_camera(args, state)
+
+            self.assertEqual(result["camera_fetch_status"], "already_secured")
+            self.assertTrue(result["camera_raw_hash_verified"])
+            self.assertTrue(result["camera_mp4_verified"])
+            manifest_mock.assert_not_called()
+            rsync_mock.assert_not_called()
+            ssh_mock.assert_not_called()
+
+    def test_repeated_fetch_detects_local_corruption_after_cleanup(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            video_dir = Path(tmpdir)
+            raw = video_dir / "session.h264"
+            raw.write_bytes(b"corrupt")
+            manifest = [{
+                "path": "/remote/session/video/session.h264",
+                "filename": "session.h264",
+                "size_bytes": 3,
+                "sha256": hashlib.sha256(b"raw").hexdigest(),
+            }]
+            state = valid_camera_state(
+                local_video_dir=str(video_dir),
+                remote_video_dir="/remote/session/video",
+                camera_raw_manifest=manifest,
+                camera_stop_confirmed=True,
+                remote_raw_cleanup_completed=True,
+                remote_raw_retained=False,
+            )
+            args = argparse.Namespace(dry_run=False, rsync_timeout_sec=1.0, ffmpeg_timeout_sec=1.0)
+            with patch.object(rc, "save_state"), patch.object(rc, "append_event"), patch.object(
+                rc, "run_ssh"
+            ) as ssh_mock, patch.object(rc, "run_rsync") as rsync_mock:
+                with self.assertRaises(RuntimeError) as raised:
+                    rc.fetch_camera(args, state)
+
+            self.assertIn("saved manifest", str(raised.exception))
+            self.assertFalse(state["camera_raw_hash_verified"])
+            self.assertFalse(state["camera_fetch_completed"])
+            ssh_mock.assert_not_called()
+            rsync_mock.assert_not_called()
+
+    def test_preview_eof_attempts_cleanup_and_is_not_confirmation(self):
+        commands = []
+
+        def fake_run_ssh(host, command, **kwargs):
+            commands.append(command)
+            return subprocess.CompletedProcess(["ssh"], 0, stdout="", stderr="")
+
+        args = argparse.Namespace(camera_host="pi@host", dry_run=False)
+        with patch.object(rc, "run_ssh", side_effect=fake_run_ssh), patch(
+            "builtins.input", side_effect=EOFError
+        ):
+            with self.assertRaises(RuntimeError) as raised:
+                rc.preview_camera(args)
+
+        self.assertIn("EOF", str(raised.exception))
+        self.assertEqual(len(commands), 2)
+        self.assertIn("camera_preview.pid", commands[-1])
+
+    def test_poststim_preserves_structured_camera_integrity_state(self):
+        screen = FakeScreen()
+        prompt_results = [True]
+        controller_state = {
+            "camera_stop_confirmed": True,
+            "camera_fetch_status": "secured",
+            "camera_transfer_command_completed": True,
+            "camera_fetch_completed": True,
+            "camera_raw_files_verified": True,
+            "camera_raw_hash_verified": True,
+            "camera_raw_file_count": 1,
+            "camera_conversion_completed": True,
+            "camera_conversion_deferred": False,
+            "camera_mp4_verified": True,
+            "remote_raw_cleanup_attempted": True,
+            "remote_raw_cleanup_completed": True,
+            "remote_raw_cleanup_error": "",
+            "remote_raw_retained": False,
+        }
+
+        with patch.object(base, "append_csv_row"), patch.object(
+            base, "prompt_yes_no", side_effect=prompt_results
+        ), patch.object(cam, "stop_camera_recording", return_value=controller_state), patch.object(
+            cam, "fetch_camera_recording", return_value=controller_state
+        ), patch.object(cam.time, "sleep", return_value=None), patch("builtins.print"):
+            result = cam.run_poststim_black_baseline(screen, "iti_raw", Path("/tmp/event_log.csv"))
+
+        self.assertTrue(result["camera_raw_hash_verified"])
+        self.assertTrue(result["camera_mp4_verified"])
+        self.assertTrue(result["remote_raw_cleanup_completed"])
+        self.assertFalse(result["remote_raw_retained"])
+        self.assertTrue(result["camera_data_secured"])
+        self.assertEqual(result["session_completed_semantics"], "stimulus_playback_completed_and_camera_stop_confirmed")
+
+    def test_poststim_deferred_conversion_is_not_camera_secured(self):
+        screen = FakeScreen()
+        prompt_results = [True, False]
+        fetch_state = {
+            "camera_stop_confirmed": True,
+            "camera_fetch_status": "deferred",
+            "camera_transfer_command_completed": True,
+            "camera_fetch_completed": True,
+            "camera_raw_files_verified": True,
+            "camera_raw_hash_verified": True,
+            "camera_conversion_completed": False,
+            "camera_conversion_deferred": True,
+            "camera_mp4_verified": False,
+            "remote_raw_cleanup_completed": False,
+            "remote_raw_retained": True,
+            "camera_conversion_error": "ffprobe unavailable",
+        }
+
+        with patch.object(base, "append_csv_row"), patch.object(
+            base, "prompt_yes_no", side_effect=prompt_results
+        ), patch.object(cam, "stop_camera_recording", return_value=fetch_state), patch.object(
+            cam, "fetch_camera_recording", return_value=fetch_state
+        ), patch.object(cam.time, "sleep", return_value=None), patch("builtins.print"):
+            result = cam.run_poststim_black_baseline(screen, "iti_raw", Path("/tmp/event_log.csv"))
+
+        self.assertTrue(result["camera_raw_hash_verified"])
+        self.assertFalse(result["camera_mp4_verified"])
+        self.assertFalse(result["camera_data_secured"])
+        self.assertTrue(result["remote_raw_retained"])
+
+    def test_poststim_leave_camera_running_is_explicitly_unsecured(self):
+        screen = FakeScreen()
+        prompt_results = [True, False, True]
+
+        with patch.object(base, "append_csv_row"), patch.object(
+            base, "prompt_yes_no", side_effect=prompt_results
+        ), patch.object(cam, "stop_camera_recording", side_effect=RuntimeError("camera still running")), patch.object(
+            cam, "fetch_camera_recording"
+        ) as fetch_mock, patch.object(cam.time, "sleep", return_value=None), patch("builtins.print"):
+            result = cam.run_poststim_black_baseline(screen, "iti_raw", Path("/tmp/event_log.csv"))
+
+        self.assertTrue(result["camera_left_running_by_user"])
+        self.assertFalse(result["camera_stop_confirmed"])
+        self.assertFalse(result["camera_fetch_completed"])
+        self.assertFalse(result["camera_mp4_verified"])
+        self.assertFalse(result["remote_raw_cleanup_completed"])
+        self.assertTrue(result["remote_raw_retained"])
+        self.assertFalse(result["camera_data_secured"])
+        fetch_mock.assert_not_called()
 if __name__ == "__main__":
     unittest.main()
