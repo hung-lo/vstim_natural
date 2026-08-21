@@ -268,6 +268,112 @@ class RemainingQcTests(unittest.TestCase):
             self.assertEqual(result["camera_conversion_skip_reason"], "ffprobe_validation_failed")
 
 
+    def test_ffmpeg_success_keeps_mp4_when_ffprobe_is_missing(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            directory = Path(tmpdir)
+            raw_path = directory / "session.h264"
+            mp4_path = directory / "session.mp4"
+            raw_path.write_bytes(b"raw-h264")
+            events = []
+
+            def fake_run(cmd, **kwargs):
+                mp4_path.write_bytes(b"remuxed-mp4")
+                return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+            with patch.object(
+                rc.shutil, "which", side_effect=lambda name: "/usr/bin/ffmpeg" if name == "ffmpeg" else None
+            ), patch.object(rc.subprocess, "run", side_effect=fake_run):
+                result = rc.convert_h264_to_mp4(
+                    directory,
+                    event_callback=lambda event, details: events.append((event, details)),
+                )
+
+            self.assertTrue(result["conversion_completed"])
+            self.assertEqual(result["unvalidated_mp4_files"], [str(mp4_path)])
+            self.assertTrue(mp4_path.exists())
+            self.assertTrue(raw_path.exists())
+            completed = next(details for event, details in events if event == "camera_conversion_completed")
+            self.assertFalse(completed["mp4_validation_available"])
+            self.assertFalse(completed["mp4_validated"])
+            self.assertEqual(completed["mp4_validation_status"], "unavailable")
+            self.assertTrue(any(event == "camera_conversion_validation_unavailable" for event, _ in events))
+
+    def test_existing_mp4_is_reconverted_when_ffprobe_is_missing(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            directory = Path(tmpdir)
+            raw_path = directory / "session.h264"
+            mp4_path = directory / "session.mp4"
+            raw_path.write_bytes(b"raw-h264")
+            mp4_path.write_bytes(b"unvalidated-existing-mp4")
+            events = []
+            ffmpeg_calls = []
+
+            def fake_run(cmd, **kwargs):
+                ffmpeg_calls.append(cmd)
+                mp4_path.write_bytes(b"new-remuxed-mp4")
+                return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+            with patch.object(
+                rc.shutil, "which", side_effect=lambda name: "/usr/bin/ffmpeg" if name == "ffmpeg" else None
+            ), patch.object(rc.subprocess, "run", side_effect=fake_run):
+                result = rc.convert_h264_to_mp4(
+                    directory,
+                    event_callback=lambda event, details: events.append((event, details)),
+                )
+
+            self.assertTrue(result["conversion_completed"])
+            self.assertTrue(result["conversion_attempted"])
+            self.assertEqual(len(ffmpeg_calls), 1)
+            existing = next(details for event, details in events if event == "camera_conversion_existing_unvalidated")
+            self.assertTrue(existing["existing_mp4_unvalidated"])
+            self.assertTrue(existing["existing_mp4_removed"])
+            self.assertFalse(existing["mp4_validation_available"])
+            self.assertEqual(existing["mp4_validation_status"], "unavailable")
+            self.assertTrue(mp4_path.exists())
+            self.assertTrue(raw_path.exists())
+
+    def test_ffprobe_timeout_keeps_new_mp4_as_unvalidated(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            directory = Path(tmpdir)
+            raw_path = directory / "session.h264"
+            mp4_path = directory / "session.mp4"
+            raw_path.write_bytes(b"raw-h264")
+
+            def fake_run(cmd, **kwargs):
+                if "-select_streams" in cmd:
+                    raise subprocess.TimeoutExpired(cmd, kwargs["timeout"])
+                mp4_path.write_bytes(b"remuxed-mp4")
+                return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+            with patch.object(rc.shutil, "which", return_value="/usr/bin/tool"), patch.object(
+                rc.subprocess, "run", side_effect=fake_run
+            ):
+                result = rc.convert_h264_to_mp4(directory)
+
+            self.assertTrue(result["conversion_completed"])
+            self.assertTrue(mp4_path.exists())
+            attempt = result["conversion_attempts"][0]
+            self.assertFalse(attempt["mp4_validation_available"])
+            self.assertEqual(attempt["mp4_validation_status"], "unavailable")
+            self.assertTrue(raw_path.exists())
+
+
+    def test_ffprobe_os_error_is_reported_as_unavailable(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            mp4_path = Path(tmpdir) / "session.mp4"
+            mp4_path.write_bytes(b"nonempty-mp4")
+
+            with patch.object(rc.shutil, "which", return_value="/usr/bin/ffprobe"), patch.object(
+                rc.subprocess, "run", side_effect=OSError("cannot execute ffprobe")
+            ):
+                validation = rc.validate_mp4_with_ffprobe(mp4_path)
+
+            self.assertFalse(validation["validation_available"])
+            self.assertIsNone(validation["valid"])
+            self.assertEqual(validation["ffprobe_path"], "/usr/bin/ffprobe")
+            self.assertIn("cannot execute ffprobe", validation["error"])
+
+
     def test_display_timing_diagnostics_are_frame_based_and_non_compensating(self):
         trial = {
             "trial_index": 0,

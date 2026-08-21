@@ -498,11 +498,14 @@ def validate_mp4_with_ffprobe(mp4_path, timeout_sec=CAMERA_FFPROBE_TIMEOUT_SEC):
     """Validate an MP4 container quickly without decoding the video."""
     mp4_path = Path(mp4_path)
     result = {
+        # A missing or unusable validator is distinct from a validator rejecting the file.
+        "validation_available": True,
         "valid": False,
         "return_code": None,
         "duration_sec": None,
         "size_bytes": _file_size_bytes(mp4_path),
         "video_stream_count": 0,
+        "ffprobe_path": None,
         "error": "",
     }
     if result["size_bytes"] <= 0:
@@ -511,8 +514,11 @@ def validate_mp4_with_ffprobe(mp4_path, timeout_sec=CAMERA_FFPROBE_TIMEOUT_SEC):
 
     ffprobe = shutil.which("ffprobe")
     if ffprobe is None:
+        result["validation_available"] = False
+        result["valid"] = None
         result["error"] = "ffprobe is not installed or not available on PATH."
         return result
+    result["ffprobe_path"] = ffprobe
 
     cmd = [
         ffprobe,
@@ -537,9 +543,13 @@ def validate_mp4_with_ffprobe(mp4_path, timeout_sec=CAMERA_FFPROBE_TIMEOUT_SEC):
             timeout=timeout_sec,
         )
     except subprocess.TimeoutExpired as exc:
+        result["validation_available"] = False
+        result["valid"] = None
         result["error"] = "ffprobe validation timed out after %.1f seconds." % timeout_sec
         return result
     except OSError as exc:
+        result["validation_available"] = False
+        result["valid"] = None
         result["error"] = "Could not run ffprobe: %s" % exc
         return result
 
@@ -630,6 +640,7 @@ def convert_h264_to_mp4(
         "output_files": [],
         "conversion_attempts": [],
         "validated_mp4_files": [],
+        "unvalidated_mp4_files": [],
         "ffmpeg_timeout_sec": timeout_sec,
         "faststart_enabled": bool(faststart),
         "ffprobe_timeout_sec": CAMERA_FFPROBE_TIMEOUT_SEC,
@@ -659,6 +670,11 @@ def convert_h264_to_mp4(
                     {
                         "mp4_path": str(output_path),
                         "mp4_size_bytes": existing_validation["size_bytes"],
+                        "mp4_validation_available": True,
+                        "mp4_validated": True,
+                        "mp4_validation_status": "valid",
+                        "ffprobe_path": existing_validation["ffprobe_path"],
+                        "ffprobe_error": "",
                         "ffprobe_valid": True,
                         "duration_sec": existing_validation["duration_sec"],
                         "video_stream_count": existing_validation["video_stream_count"],
@@ -668,17 +684,30 @@ def convert_h264_to_mp4(
                 continue
 
             partial_mp4_deleted = _delete_partial_mp4(output_path)
+            existing_event = (
+                "camera_conversion_existing_unvalidated"
+                if not existing_validation["validation_available"]
+                else "camera_conversion_existing_invalid"
+            )
             emit(
-                "camera_conversion_existing_invalid",
+                existing_event,
                 {
                     "mp4_path": str(output_path),
                     "mp4_size_bytes": existing_validation["size_bytes"],
-                    "ffprobe_valid": False,
+                    "mp4_validation_available": existing_validation["validation_available"],
+                    "mp4_validated": False,
+                    "mp4_validation_status": (
+                        "unavailable" if not existing_validation["validation_available"] else "invalid"
+                    ),
+                    "ffprobe_path": existing_validation["ffprobe_path"],
+                    "ffprobe_error": existing_validation["error"],
+                    "ffprobe_valid": existing_validation["valid"],
                     "duration_sec": existing_validation["duration_sec"],
                     "video_stream_count": existing_validation["video_stream_count"],
                     "ffprobe_return_code": existing_validation["return_code"],
                     "error_message": existing_validation["error"],
-                    "existing_mp4_invalid": True,
+                    "existing_mp4_invalid": bool(existing_validation["validation_available"]),
+                    "existing_mp4_unvalidated": not existing_validation["validation_available"],
                     "existing_mp4_removed": partial_mp4_deleted,
                     "raw_h264_still_present": _raw_file_is_present(input_path),
                 },
@@ -702,7 +731,12 @@ def convert_h264_to_mp4(
             "partial_mp4_deleted": partial_mp4_deleted,
             "error_message": "",
             "reason": "",
-            "ffprobe_valid": False,
+            "ffprobe_valid": None,
+            "mp4_validation_available": None,
+            "mp4_validated": False,
+            "mp4_validation_status": "not_run",
+            "ffprobe_path": None,
+            "ffprobe_error": "",
             "ffprobe_return_code": None,
             "duration_sec": None,
             "video_stream_count": 0,
@@ -784,10 +818,31 @@ def convert_h264_to_mp4(
 
         validation = validate_mp4_with_ffprobe(output_path)
         attempt["ffprobe_valid"] = validation["valid"]
+        attempt["mp4_validation_available"] = validation["validation_available"]
+        attempt["mp4_validated"] = bool(validation["valid"])
+        attempt["mp4_validation_status"] = (
+            "valid"
+            if validation["valid"]
+            else "unavailable" if not validation["validation_available"] else "invalid"
+        )
+        attempt["ffprobe_path"] = validation["ffprobe_path"]
+        attempt["ffprobe_error"] = validation["error"]
         attempt["ffprobe_return_code"] = validation["return_code"]
         attempt["duration_sec"] = validation["duration_sec"]
         attempt["video_stream_count"] = validation["video_stream_count"]
         attempt["output_size_bytes"] = validation["size_bytes"]
+        if not validation["validation_available"]:
+            attempt["reason"] = "ffprobe_validation_unavailable"
+            attempt["error_message"] = validation["error"]
+            attempt["raw_h264_still_present"] = _raw_file_is_present(input_path)
+            result["conversion_attempts"].append(dict(attempt))
+            result["output_files"].append(str(output_path))
+            result["unvalidated_mp4_files"].append(str(output_path))
+            emit("camera_conversion_validation_unavailable", attempt)
+            emit("camera_conversion_completed", attempt)
+            print("Converted %s -> %s (ffprobe validation unavailable)" % (input_path.name, output_path.name))
+            continue
+
         if not validation["valid"]:
             attempt["reason"] = "ffprobe_validation_failed"
             attempt["error_message"] = validation["error"] or "ffprobe rejected the generated MP4."
