@@ -31,7 +31,7 @@ import run_stringer_vstim as base
 
 def valid_ffprobe_json():
     return json.dumps({
-        "streams": [{"codec_name": "h264", "width": 1024, "height": 600, "duration": "12.5"}],
+        "streams": [{"codec_name": "h264", "width": 1024, "height": 600, "r_frame_rate": "30/1", "duration": "12.5"}],
         "format": {"duration": "12.5", "size": "9"},
     })
 
@@ -288,7 +288,7 @@ class RemainingQcTests(unittest.TestCase):
                     event_callback=lambda event, details: events.append((event, details)),
                 )
 
-            self.assertTrue(result["conversion_completed"])
+            self.assertFalse(result["conversion_completed"])
             self.assertEqual(result["unvalidated_mp4_files"], [str(mp4_path)])
             self.assertTrue(mp4_path.exists())
             self.assertTrue(raw_path.exists())
@@ -321,7 +321,7 @@ class RemainingQcTests(unittest.TestCase):
                     event_callback=lambda event, details: events.append((event, details)),
                 )
 
-            self.assertTrue(result["conversion_completed"])
+            self.assertFalse(result["conversion_completed"])
             self.assertTrue(result["conversion_attempted"])
             self.assertEqual(len(ffmpeg_calls), 1)
             existing = next(details for event, details in events if event == "camera_conversion_existing_unvalidated")
@@ -350,7 +350,7 @@ class RemainingQcTests(unittest.TestCase):
             ):
                 result = rc.convert_h264_to_mp4(directory)
 
-            self.assertTrue(result["conversion_completed"])
+            self.assertFalse(result["conversion_completed"])
             self.assertTrue(mp4_path.exists())
             attempt = result["conversion_attempts"][0]
             self.assertFalse(attempt["mp4_validation_available"])
@@ -372,6 +372,24 @@ class RemainingQcTests(unittest.TestCase):
             self.assertIsNone(validation["valid"])
             self.assertEqual(validation["ffprobe_path"], "/usr/bin/ffprobe")
             self.assertIn("cannot execute ffprobe", validation["error"])
+
+    def test_ffprobe_requires_dimensions_duration_and_frame_rate(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            mp4_path = Path(tmpdir) / "session.mp4"
+            mp4_path.write_bytes(b"nonempty-mp4")
+            incomplete = json.dumps({
+                "streams": [{"codec_name": "h264", "width": 1024, "height": 600, "duration": "12.5"}],
+                "format": {"duration": "12.5"},
+            })
+            with patch.object(rc.shutil, "which", return_value="/usr/bin/ffprobe"), patch.object(
+                rc.subprocess,
+                "run",
+                return_value=subprocess.CompletedProcess(["ffprobe"], 0, stdout=incomplete, stderr=""),
+            ):
+                validation = rc.validate_mp4_with_ffprobe(mp4_path)
+
+            self.assertFalse(validation["valid"])
+            self.assertIn("frame rate", validation["error"])
 
 
     def test_display_timing_diagnostics_are_frame_based_and_non_compensating(self):

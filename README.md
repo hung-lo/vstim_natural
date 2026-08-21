@@ -113,6 +113,26 @@ transfer or while a failed transfer is being resolved.
 Keep `run_stringer_vstim.py` around as the plain no-camera runner and as the
 baseline path if you want to debug the display flow independently.
 
+## Camera recovery and file integrity
+
+The camera controller stores its session state in:
+
+```text
+/mnt/hd/.vstim_natural_camera_session.json
+```
+
+The state is namespaced to this repository and protocol. An older generic
+`.last_remote_camera_session.json` is rejected rather than used for automatic
+stop, fetch, or remote deletion, because its session ownership cannot be
+proven safely.
+
+Camera fetch is deliberately non-destructive at first: `rsync` copies the raw
+`.h264` files without deleting them from box 152. The controller then verifies
+remote and local size/SHA-256 manifests, converts and strictly validates the
+`.mp4` files with `ffprobe`, and only then deletes the exact verified raw paths
+on box 152. If transfer, conversion, validation, or cleanup fails, raw files
+are retained so `fetch` or `convert` can be retried safely.
+
 ## Photodiode patch
 
 The photodiode patch is built into the session raw files. The current default

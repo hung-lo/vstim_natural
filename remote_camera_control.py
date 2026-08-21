@@ -24,13 +24,16 @@ You can still override the host manually with:
 
 import argparse
 import csv
+import hashlib
 import json
 import math
+import os
 import re
 import shutil
 import shlex
 import subprocess
 import sys
+import tempfile
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -74,13 +77,37 @@ CAMERA_STOP_VERIFY_TIMEOUT_SEC = 8.0
 CAMERA_STOP_VERIFY_POLL_SEC = 0.25
 CAMERA_PREVIEW_STOP_TIMEOUT_SEC = 5.0
 SESSION_NAME_SUFFIX = "vstim_natural"
+CAMERA_STATE_SCHEMA_VERSION = 1
+CONTROLLER_REPOSITORY = "vstim_natural"
+PROTOCOL_NAME = "stringer_natural_image_visual_stimulus"
 
 CAMERA_FRAMERATE = 30
 JSON_RESULT_PREFIX = "CAMERA_CONTROL_RESULT_JSON="
 
 PROJECT_ROOT = Path(__file__).resolve().parent
-STATE_FILE = LOCAL_VIDEO_ROOT / ".last_remote_camera_session.json"
+STATE_FILE = LOCAL_VIDEO_ROOT / ".vstim_natural_camera_session.json"
+GENERIC_STATE_FILE = LOCAL_VIDEO_ROOT / ".last_remote_camera_session.json"
 LEGACY_STATE_FILE = PROJECT_ROOT / "stim_logs" / ".last_remote_camera_session.json"
+
+
+class CameraStateError(RuntimeError):
+    """Base class for saved-camera-state validation failures."""
+
+
+class CameraStateNotFoundError(CameraStateError):
+    pass
+
+
+class CameraStateOwnershipError(CameraStateError):
+    pass
+
+
+class CameraStateSchemaError(CameraStateError):
+    pass
+
+
+class CameraStateCorruptError(CameraStateError):
+    pass
 
 
 def utc_iso_now():
@@ -420,7 +447,6 @@ def run_rsync(camera_host, remote_dir, local_dir, dry_run=False, timeout_sec=CAM
             "--progress",
             "--partial",
             "--timeout=30",
-            "--remove-source-files",
             f"{camera_host}:{remote_dir.rstrip('/')}/",
             str(local_dir) + "/",
         ],
@@ -428,6 +454,156 @@ def run_rsync(camera_host, remote_dir, local_dir, dry_run=False, timeout_sec=CAM
         dry_run=dry_run,
         timeout=timeout_sec,
     )
+
+
+def build_remote_camera_manifest_command(remote_video_dir):
+    manifest_script = (
+        "for path do "
+        "size=$(stat -c '%s' \"$path\") || exit 1; "
+        "hash=$(sha256sum \"$path\" | cut -d ' ' -f 1) || exit 1; "
+        "printf '%s\\t%s\\t%s\\n' \"$path\" \"$size\" \"$hash\"; "
+        "done"
+    )
+    return (
+        "find %s -maxdepth 1 -type f -name %s -print0 | "
+        "xargs -0 -r sh -c %s sh | sort"
+        % (
+            shlex.quote(remote_video_dir),
+            shlex.quote(CAMERA_OUTPUT_GLOB),
+            shlex.quote(manifest_script),
+        )
+    )
+
+
+def parse_camera_manifest(stdout):
+    manifest = []
+    for line in (stdout or "").splitlines():
+        parts = line.split("\t")
+        if len(parts) != 3:
+            continue
+        path, size_text, digest = parts
+        try:
+            size_bytes = int(size_text)
+        except ValueError:
+            continue
+        if size_bytes <= 0 or not re.fullmatch(r"[0-9a-fA-F]{64}", digest):
+            continue
+        manifest.append(
+            {
+                "path": path,
+                "filename": Path(path).name,
+                "size_bytes": size_bytes,
+                "sha256": digest.lower(),
+            }
+        )
+    return manifest
+
+
+def fetch_remote_camera_manifest(camera_host, remote_video_dir, dry_run=False):
+    result = run_ssh(
+        camera_host,
+        build_remote_camera_manifest_command(remote_video_dir),
+        dry_run=dry_run,
+        timeout=CAMERA_RSYNC_TIMEOUT_SEC,
+    )
+    manifest = parse_camera_manifest(result.stdout)
+    if (result.stdout or "").strip() and not manifest:
+        raise CameraStateError("Remote camera manifest was present but could not be parsed safely.")
+    return manifest
+
+
+def sha256_file(path):
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def local_camera_manifest(local_video_dir, expected_manifest=None):
+    local_video_dir = Path(local_video_dir)
+    raw_files = find_local_camera_raw_files(local_video_dir)
+    by_name = {path.name: path for path in raw_files}
+    if expected_manifest is not None:
+        expected_names = {entry["filename"] for entry in expected_manifest}
+        if set(by_name) != expected_names:
+            raise RuntimeError(
+                "Local camera raw files do not match the remote manifest: local=%s remote=%s"
+                % (sorted(by_name), sorted(expected_names))
+            )
+    manifest = []
+    for path in sorted(raw_files):
+        manifest.append(
+            {
+                "filename": path.name,
+                "size_bytes": path.stat().st_size,
+                "sha256": sha256_file(path),
+            }
+        )
+    return manifest
+
+
+def verify_raw_manifest(local_video_dir, remote_manifest):
+    if not remote_manifest:
+        raise RuntimeError("Remote camera manifest contains no .h264 files.")
+    local_manifest = local_camera_manifest(local_video_dir, remote_manifest)
+    expected = {
+        entry["filename"]: (entry["size_bytes"], entry["sha256"])
+        for entry in remote_manifest
+    }
+    actual = {
+        entry["filename"]: (entry["size_bytes"], entry["sha256"])
+        for entry in local_manifest
+    }
+    if actual != expected:
+        raise RuntimeError(
+            "Local camera raw verification failed: local size/SHA-256 manifest does not match remote."
+        )
+    return local_manifest
+
+
+def manifest_key(manifest):
+    return sorted(
+        (entry["path"], entry["filename"], entry["size_bytes"], entry["sha256"])
+        for entry in manifest
+    )
+
+
+def validate_local_mp4_files(local_video_dir, raw_manifest):
+    validations = []
+    for entry in raw_manifest:
+        mp4_path = Path(local_video_dir) / Path(entry["filename"]).with_suffix(".mp4")
+        validation = validate_mp4_with_ffprobe(mp4_path)
+        validations.append(validation)
+        if not validation["validation_available"] or not validation["valid"]:
+            raise RuntimeError(
+                "MP4 verification failed for %s: %s" % (mp4_path, validation["error"])
+            )
+    return validations
+
+
+def delete_remote_camera_raw_files(
+    camera_host,
+    remote_video_dir,
+    local_video_dir,
+    expected_manifest,
+    dry_run=False,
+):
+    """Delete only the exact remote raw paths after a fresh integrity gate."""
+    fresh_manifest = fetch_remote_camera_manifest(camera_host, remote_video_dir, dry_run=dry_run)
+    if manifest_key(fresh_manifest) != manifest_key(expected_manifest):
+        raise RuntimeError("Remote camera files changed before destructive cleanup; raw files were retained.")
+    verify_raw_manifest(local_video_dir, fresh_manifest)
+    validate_local_mp4_files(local_video_dir, fresh_manifest)
+    if fresh_manifest:
+        command = "rm -f -- " + " ".join(shlex.quote(entry["path"]) for entry in fresh_manifest)
+        run_ssh(camera_host, command, dry_run=dry_run, timeout=CAMERA_RSYNC_TIMEOUT_SEC)
+    return {
+        "remote_raw_cleanup_completed": True,
+        "remote_raw_retained": False,
+        "remote_raw_cleanup_error": "",
+        "remote_raw_cleanup_manifest": fresh_manifest,
+    }
 
 
 def find_local_camera_raw_files(local_video_dir):
@@ -443,7 +619,9 @@ def find_local_camera_raw_files(local_video_dir):
     return raw_files
 
 
-def verify_local_camera_raw_files(local_video_dir):
+def verify_local_camera_raw_files(local_video_dir, remote_manifest=None):
+    if remote_manifest is not None:
+        return verify_raw_manifest(local_video_dir, remote_manifest)
     raw_files = []
     empty_files = []
     for path in find_local_camera_raw_files(local_video_dir):
@@ -505,6 +683,9 @@ def validate_mp4_with_ffprobe(mp4_path, timeout_sec=CAMERA_FFPROBE_TIMEOUT_SEC):
         "duration_sec": None,
         "size_bytes": _file_size_bytes(mp4_path),
         "video_stream_count": 0,
+        "width": None,
+        "height": None,
+        "frame_rate": None,
         "ffprobe_path": None,
         "error": "",
     }
@@ -574,6 +755,30 @@ def validate_mp4_with_ffprobe(mp4_path, timeout_sec=CAMERA_FFPROBE_TIMEOUT_SEC):
         result["error"] = "ffprobe found no video stream."
         return result
 
+    stream = streams[0]
+    try:
+        result["width"] = int(stream.get("width"))
+        result["height"] = int(stream.get("height"))
+    except (TypeError, ValueError):
+        result["error"] = "ffprobe did not report a parseable video width and height."
+        return result
+    if result["width"] <= 0 or result["height"] <= 0:
+        result["error"] = "ffprobe reported non-positive video dimensions."
+        return result
+
+    frame_rate_text = stream.get("r_frame_rate")
+    try:
+        if not frame_rate_text or "/" not in str(frame_rate_text):
+            raise ValueError
+        numerator, denominator = str(frame_rate_text).split("/", 1)
+        frame_rate = float(numerator) / float(denominator)
+        if not math.isfinite(frame_rate) or frame_rate <= 0:
+            raise ValueError
+        result["frame_rate"] = frame_rate
+    except (TypeError, ValueError, ZeroDivisionError):
+        result["error"] = "ffprobe did not report a parseable positive video frame rate."
+        return result
+
     duration_value = None
     stream_duration = streams[0].get("duration") if streams else None
     format_duration = (payload.get("format") or {}).get("duration")
@@ -591,6 +796,9 @@ def validate_mp4_with_ffprobe(mp4_path, timeout_sec=CAMERA_FFPROBE_TIMEOUT_SEC):
             result["error"] = "ffprobe reported an invalid duration: %s" % duration_value
             return result
         result["duration_sec"] = duration_value
+    else:
+        result["error"] = "ffprobe did not report a positive video duration."
+        return result
 
     result["valid"] = True
     return result
@@ -860,7 +1068,12 @@ def convert_h264_to_mp4(
         emit("camera_conversion_completed", attempt)
         print("Converted %s -> %s" % (input_path.name, output_path.name))
 
-    result["conversion_completed"] = bool(result["output_files"]) and len(result["output_files"]) == len(h264_files)
+    result["conversion_completed"] = (
+        bool(result["validated_mp4_files"])
+        and len(result["validated_mp4_files"]) == len(h264_files)
+        and not result["unvalidated_mp4_files"]
+    )
+    result["mp4_verified"] = result["conversion_completed"]
     return result
 
 def run_camera_conversion_workflow(
@@ -881,6 +1094,7 @@ def run_camera_conversion_workflow(
         "camera_conversion_deferred": False,
         "camera_conversion_error": "",
         "camera_conversion_skip_reason": "",
+        "camera_mp4_verified": False,
         "converted_mp4_files": [],
         "conversion_result": None,
         "conversion_attempts": [],
@@ -996,9 +1210,10 @@ def run_camera_conversion_workflow(
     result["conversion_attempts"] = list(conversion_result.get("conversion_attempts", []))
     result["camera_conversion_attempted"] = bool(conversion_result.get("conversion_attempted"))
     result["camera_conversion_completed"] = bool(conversion_result.get("conversion_completed"))
-    result["camera_conversion_deferred"] = bool(conversion_result.get("conversion_skipped"))
+    result["camera_conversion_deferred"] = not result["camera_conversion_completed"]
     result["camera_conversion_skip_reason"] = conversion_result.get("conversion_skip_reason") or ""
     result["converted_mp4_files"] = list(conversion_result.get("output_files", []))
+    result["camera_mp4_verified"] = bool(conversion_result.get("mp4_verified"))
     result["raw_h264_still_present"] = all(_raw_file_is_present(path) for path in raw_files)
 
     if not result["camera_conversion_completed"]:
@@ -1039,27 +1254,88 @@ def append_event(local_video_dir, event, details=None):
 
 def save_state(state):
     STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
-    STATE_FILE.write_text(json.dumps(state, indent=2), encoding="utf-8")
+    temporary_path = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=str(STATE_FILE.parent),
+            prefix=".%s." % STATE_FILE.name,
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            temporary_path = Path(handle.name)
+            json.dump(state, handle, indent=2, sort_keys=True)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(str(temporary_path), str(STATE_FILE))
+    finally:
+        if temporary_path is not None and temporary_path.exists():
+            temporary_path.unlink()
     print("Saved state: %s" % STATE_FILE)
 
 
+def validate_camera_state(state, source_path):
+    if not isinstance(state, dict):
+        raise CameraStateCorruptError("Camera state at %s is not a JSON object." % source_path)
+    if state.get("controller_repository") != CONTROLLER_REPOSITORY:
+        raise CameraStateOwnershipError(
+            "Camera state at %s is not owned by %s." % (source_path, CONTROLLER_REPOSITORY)
+        )
+    if state.get("protocol_name") != PROTOCOL_NAME:
+        raise CameraStateOwnershipError(
+            "Camera state at %s has an unexpected protocol identity." % source_path
+        )
+    if state.get("state_schema_version") != CAMERA_STATE_SCHEMA_VERSION:
+        raise CameraStateSchemaError(
+            "Camera state at %s has unsupported schema version %r." % (source_path, state.get("state_schema_version"))
+        )
+    required_fields = (
+        "session_id",
+        "mouse_id",
+        "camera_host",
+        "remote_session_dir",
+        "remote_video_dir",
+        "remote_base_path",
+        "local_session_dir",
+        "local_video_dir",
+        "camera_pid",
+        "remote_pid_file",
+        "camera_start_requested_utc",
+        "camera_start_confirmed_utc",
+        "camera_stop_confirmed_utc",
+    )
+    missing = [field for field in required_fields if field not in state]
+    if missing:
+        raise CameraStateSchemaError(
+            "Camera state at %s is missing required fields: %s" % (source_path, ", ".join(missing))
+        )
+    return state
+
+
 def load_state():
-    state_file = STATE_FILE if STATE_FILE.exists() else LEGACY_STATE_FILE if LEGACY_STATE_FILE.exists() else None
-    if state_file is None:
-        raise RuntimeError(
+    if STATE_FILE.exists():
+        state_file = STATE_FILE
+    elif GENERIC_STATE_FILE.exists() or LEGACY_STATE_FILE.exists():
+        legacy_path = GENERIC_STATE_FILE if GENERIC_STATE_FILE.exists() else LEGACY_STATE_FILE
+        raise CameraStateOwnershipError(
+            "Legacy generic camera state exists at %s. Automatic destructive recovery is disabled because ownership cannot be proven. "
+            "Use explicit --mouse-id and --session-id recovery arguments or migrate the state manually." % legacy_path
+        )
+    else:
+        raise CameraStateNotFoundError(
             "No saved camera session state found at %s.\n"
             "Also checked legacy location %s.\n"
             "Run `python3 remote_camera_control.py start --mouse-id <mouse_id>` first, "
             "or pass `--mouse-id` and `--session-id` to fetch/stop-fetch."
-            % (STATE_FILE, LEGACY_STATE_FILE)
+            % (STATE_FILE, GENERIC_STATE_FILE)
         )
-    state = json.loads(state_file.read_text(encoding="utf-8"))
-    if state_file == LEGACY_STATE_FILE and state.get("mouse_id") and state.get("session_id"):
-        session_id = state["session_id"]
-        local_session_dir = (LOCAL_VIDEO_ROOT / session_id).resolve()
-        state["local_session_dir"] = str(local_session_dir)
-        state["local_video_dir"] = str(local_session_dir / "video")
-    return state
+    try:
+        state = json.loads(state_file.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError) as exc:
+        raise CameraStateCorruptError("Could not read valid JSON camera state at %s: %s" % (state_file, exc)) from exc
+    return validate_camera_state(state, state_file)
 
 
 def build_state_from_args(args):
@@ -1077,12 +1353,19 @@ def build_state_from_args(args):
     paths = make_session_paths(args)
     camera_host = resolve_camera_host(args)
     return {
+        "state_schema_version": CAMERA_STATE_SCHEMA_VERSION,
+        "controller_repository": CONTROLLER_REPOSITORY,
+        "protocol_name": PROTOCOL_NAME,
         "created_utc": utc_iso_now(),
         "camera_host": camera_host,
         "framerate": getattr(args, "framerate", CAMERA_FRAMERATE),
         "remote_camera_repo": getattr(args, "remote_camera_repo", REMOTE_CAMERA_REPO),
         "remote_camera_start": getattr(args, "remote_camera_start", REMOTE_CAMERA_START),
         "remote_camera_stop": getattr(args, "remote_camera_stop", REMOTE_CAMERA_STOP),
+        "camera_pid": None,
+        "camera_start_requested_utc": None,
+        "camera_start_confirmed_utc": None,
+        "camera_stop_confirmed_utc": None,
         **paths,
     }
 
@@ -1131,6 +1414,9 @@ def start_camera(args):
     local_video_dir.mkdir(parents=True, exist_ok=True)
 
     state = {
+        "state_schema_version": CAMERA_STATE_SCHEMA_VERSION,
+        "controller_repository": CONTROLLER_REPOSITORY,
+        "protocol_name": PROTOCOL_NAME,
         "created_utc": utc_iso_now(),
         "camera_host": camera_host,
         "framerate": args.framerate,
@@ -1149,6 +1435,7 @@ def start_camera(args):
         "camera_launch_returned_utc": None,
         "camera_output_growth_confirmed_utc": None,
         "camera_start_confirmed_utc": None,
+        "camera_stop_confirmed_utc": None,
         **paths,
     }
 
@@ -1328,10 +1615,9 @@ def start_camera(args):
 
 def stop_camera(args, state=None):
     if state is None:
-        try:
-            state = load_state()
-        except RuntimeError:
-            state = {}
+        state = load_state()
+    else:
+        state = validate_camera_state(state, "in-memory state")
 
     camera_host = resolve_camera_host(args, state)
     local_video_dir = Path(state.get("local_video_dir", LOCAL_VIDEO_ROOT / "unknown" / "video"))
@@ -1474,8 +1760,10 @@ def convert_camera(args, state=None):
     if state is None:
         try:
             state = load_state()
-        except RuntimeError:
+        except CameraStateNotFoundError:
             state = build_state_from_args(args)
+    else:
+        state = validate_camera_state(state, "in-memory state")
 
     camera_host = resolve_camera_host(args, state)
     local_video_dir = Path(state["local_video_dir"])
@@ -1504,7 +1792,9 @@ def convert_camera(args, state=None):
         state["camera_conversion_failed_utc"] = utc_iso_now()
         state["camera_conversion_error"] = str(exc)
         state["camera_conversion_completed"] = False
-        state["camera_conversion_deferred"] = False
+        state["camera_conversion_deferred"] = True
+        state["camera_mp4_verified"] = False
+        save_state(state)
         append_event(
             local_video_dir,
             "camera_conversion_failed",
@@ -1522,6 +1812,9 @@ def convert_camera(args, state=None):
     state["camera_conversion_completed_utc"] = utc_iso_now() if conversion_state.get("camera_conversion_completed") else ""
     state["camera_conversion_failed"] = False
     state["camera_conversion_failed_utc"] = ""
+    state["camera_mp4_verified"] = bool(conversion_state.get("camera_mp4_verified"))
+    state["camera_conversion_deferred"] = not state["camera_mp4_verified"]
+    save_state(state)
     if conversion_state.get("camera_conversion_completed"):
         print("Converted camera files in: %s" % local_video_dir)
     return state
@@ -1535,13 +1828,17 @@ def fetch_camera(args, state=None):
     if state is None:
         try:
             state = load_state()
-        except RuntimeError:
+        except CameraStateNotFoundError:
             state = build_state_from_args(args)
+    else:
+        state = validate_camera_state(state, "in-memory state")
 
     camera_host = resolve_camera_host(args, state)
     remote_video_dir = state["remote_video_dir"]
     local_video_dir = Path(state["local_video_dir"])
     local_video_dir.mkdir(parents=True, exist_ok=True)
+    prior_raw_hash_verified = bool(state.get("camera_raw_hash_verified"))
+    prior_remote_cleanup_completed = bool(state.get("remote_raw_cleanup_completed"))
     state["camera_transfer_command_completed"] = False
     state["camera_fetch_completed"] = False
     state["camera_conversion_attempted"] = False
@@ -1549,8 +1846,12 @@ def fetch_camera(args, state=None):
     state["camera_conversion_deferred"] = False
     state["camera_fetch_timed_out"] = False
     state["camera_raw_files_verified"] = False
+    state["camera_raw_hash_verified"] = False
     state["raw_h264_available_locally"] = False
     state["converted_mp4_files"] = []
+    state["remote_raw_cleanup_completed"] = False
+    state["remote_raw_retained"] = True
+    save_state(state)
 
     append_event(
         local_video_dir,
@@ -1565,6 +1866,10 @@ def fetch_camera(args, state=None):
     )
 
     try:
+        remote_manifest_before = fetch_remote_camera_manifest(
+            camera_host, remote_video_dir, dry_run=args.dry_run
+        )
+        state["remote_raw_manifest_before_transfer"] = remote_manifest_before
         run_rsync(
             camera_host,
             remote_video_dir,
@@ -1590,10 +1895,48 @@ def fetch_camera(args, state=None):
                 "error": str(exc),
             },
         )
+        save_state(state)
+        raise
+
+    try:
+        remote_manifest_after = fetch_remote_camera_manifest(
+            camera_host, remote_video_dir, dry_run=args.dry_run
+        )
+        if remote_manifest_before:
+            if manifest_key(remote_manifest_after) != manifest_key(remote_manifest_before):
+                raise RuntimeError("Remote camera files changed during transfer; raw files were retained.")
+            verify_raw_manifest(local_video_dir, remote_manifest_after)
+            state["camera_raw_hash_verified"] = True
+            state["camera_raw_manifest"] = remote_manifest_after
+        elif prior_raw_hash_verified and prior_remote_cleanup_completed:
+            verify_local_camera_raw_files(local_video_dir)
+            state["camera_raw_hash_verified"] = True
+            state["camera_raw_manifest"] = state.get("camera_raw_manifest", [])
+        else:
+            raise RuntimeError("Remote camera manifest is empty and no prior raw verification is recorded.")
+    except Exception as exc:
+        state["camera_fetch_failed"] = True
+        state["camera_fetch_failed_utc"] = utc_iso_now()
+        state["camera_fetch_error"] = str(exc)
+        append_event(
+            local_video_dir,
+            "camera_raw_verification_failed",
+            {
+                "camera_host": camera_host,
+                "remote_video_dir": remote_video_dir,
+                "local_video_dir": str(local_video_dir),
+                "stage": "raw_verification",
+                "error": str(exc),
+            },
+        )
+        save_state(state)
         raise
 
     state["camera_transfer_command_completed"] = True
+    state["camera_raw_files_verified"] = True
+    state["camera_raw_file_count"] = len(find_local_camera_raw_files(local_video_dir))
     state["camera_fetch_returned_utc"] = utc_iso_now()
+    save_state(state)
     append_event(
         local_video_dir,
         "camera_fetch_returned",
@@ -1637,6 +1980,7 @@ def fetch_camera(args, state=None):
                 "error": str(exc),
             },
         )
+        save_state(state)
         raise
 
     state.update(conversion_state)
@@ -1651,11 +1995,47 @@ def fetch_camera(args, state=None):
     state["camera_conversion_error"] = conversion_state.get("camera_conversion_error", "")
     state["camera_conversion_skip_reason"] = conversion_state.get("camera_conversion_skip_reason", "")
     state["converted_mp4_files"] = conversion_state.get("converted_mp4_files", [])
+    state["camera_mp4_verified"] = bool(conversion_state.get("camera_mp4_verified"))
+    state["remote_raw_retained"] = True
+    if prior_remote_cleanup_completed and not remote_manifest_before:
+        state["remote_raw_cleanup_completed"] = True
+        state["remote_raw_retained"] = False
+        state["remote_raw_cleanup_error"] = ""
+    elif state["camera_raw_hash_verified"] and state["camera_mp4_verified"]:
+        try:
+            cleanup_state = delete_remote_camera_raw_files(
+                camera_host,
+                remote_video_dir,
+                local_video_dir,
+                state.get("camera_raw_manifest", []),
+                dry_run=args.dry_run,
+            )
+            state.update(cleanup_state)
+        except Exception as exc:
+            state["remote_raw_cleanup_completed"] = False
+            state["remote_raw_cleanup_error"] = str(exc)
+            state["remote_raw_retained"] = True
+            append_event(
+                local_video_dir,
+                "remote_raw_cleanup_failed",
+                {
+                    "camera_host": camera_host,
+                    "remote_video_dir": remote_video_dir,
+                    "error": str(exc),
+                    "raw_h264_retained": True,
+                },
+            )
+            save_state(state)
+            raise
+    save_state(state)
     print("Fetched camera files to: %s" % local_video_dir)
     return state
 
 def status_camera(args):
-    state = load_state() if STATE_FILE.exists() else None
+    try:
+        state = load_state()
+    except CameraStateNotFoundError:
+        state = None
     camera_host = resolve_camera_host(args, state)
     safe_start_pattern = "[v]ideo_acquisition/start_acquisition.py"
     remote_cmd = (
@@ -1700,11 +2080,15 @@ def build_parser():
     stop.set_defaults(func=stop_camera)
 
     fetch = sub.add_parser("fetch", parents=[common], help="Fetch last remote camera files with rsync.")
+    fetch.add_argument("--mouse-id", default=None, help="Mouse ID if no saved session state exists yet.")
+    fetch.add_argument("--session-id", default=None, help="Session ID if no saved session state exists yet.")
     fetch.add_argument("--rsync-timeout-sec", type=float, default=CAMERA_RSYNC_TIMEOUT_SEC)
     fetch.add_argument("--ffmpeg-timeout-sec", type=float, default=CAMERA_FFMPEG_TIMEOUT_SEC)
     fetch.set_defaults(func=fetch_camera)
 
     convert = sub.add_parser("convert", parents=[common], help="Convert locally fetched .h264 files to MP4.")
+    convert.add_argument("--mouse-id", default=None, help="Mouse ID if no saved session state exists yet.")
+    convert.add_argument("--session-id", default=None, help="Session ID if no saved session state exists yet.")
     convert.add_argument("--ffmpeg-timeout-sec", type=float, default=CAMERA_FFMPEG_TIMEOUT_SEC)
     convert.set_defaults(func=convert_camera)
 
@@ -1722,9 +2106,11 @@ def build_parser():
     def do_stop_fetch(args):
         try:
             state = load_state()
-        except RuntimeError:
+        except CameraStateNotFoundError:
             state = build_state_from_args(args)
         state = stop_camera(args, state)
+        if not state.get("camera_stop_confirmed"):
+            raise CameraStateError("Camera stop was not verified; refusing to fetch or delete remote camera files.")
         time.sleep(2.0)
         return fetch_camera(args, state)
 

@@ -1,4 +1,6 @@
 import argparse
+import hashlib
+import json
 import subprocess
 import sys
 import tempfile
@@ -25,6 +27,29 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import remote_camera_control as rc
 import run_stringer_vstim as base
 import run_stringer_vstim_cam as cam
+
+
+def valid_camera_state(**overrides):
+    state = {
+        "state_schema_version": rc.CAMERA_STATE_SCHEMA_VERSION,
+        "controller_repository": rc.CONTROLLER_REPOSITORY,
+        "protocol_name": rc.PROTOCOL_NAME,
+        "session_id": "session",
+        "mouse_id": "mouse",
+        "camera_host": "pi@host",
+        "remote_session_dir": "/remote/session",
+        "remote_video_dir": "/remote/session/video",
+        "remote_base_path": "/remote/session/video/session",
+        "remote_pid_file": "/remote/session/video/camera_acquisition.pid",
+        "local_session_dir": "/tmp/session",
+        "local_video_dir": "/tmp/session/video",
+        "camera_pid": None,
+        "camera_start_requested_utc": "now",
+        "camera_start_confirmed_utc": "now",
+        "camera_stop_confirmed_utc": None,
+    }
+    state.update(overrides)
+    return state
 
 
 class FakeScreen:
@@ -76,7 +101,7 @@ class CameraControlAndPoststimTests(unittest.TestCase):
 
         self.assertIn("--partial", captured["cmd"])
         self.assertIn("--timeout=30", captured["cmd"])
-        self.assertIn("--remove-source-files", captured["cmd"])
+        self.assertNotIn("--remove-source-files", captured["cmd"])
         self.assertEqual(captured["timeout"], 123.0)
 
     def test_convert_timeout_removes_incomplete_mp4_and_keeps_h264(self):
@@ -105,17 +130,18 @@ class CameraControlAndPoststimTests(unittest.TestCase):
     def test_fetch_timeout_logs_rsync_failure_without_fetch_return(self):
         events = []
         args = argparse.Namespace(dry_run=False, rsync_timeout_sec=1.0, ffmpeg_timeout_sec=1.0)
-        state = {
-            "camera_host": "pi@host",
-            "remote_video_dir": "/remote/session/video",
-            "local_video_dir": "/tmp/session/video",
-            "framerate": 30,
-        }
+        state = valid_camera_state(
+            remote_video_dir="/remote/session/video",
+            local_video_dir="/tmp/session/video",
+            framerate=30,
+        )
 
         def fake_append_event(local_video_dir, event, details=None):
             events.append((event, details or {}))
 
         with patch.object(rc, "run_rsync", side_effect=RuntimeError("Command timed out after 1.0 seconds")), patch.object(
+            rc, "fetch_remote_camera_manifest", return_value=[{"path": "/remote/session/video/session.h264", "filename": "session.h264", "size_bytes": 10, "sha256": "0" * 64}]
+        ), patch.object(rc, "save_state"), patch.object(
             rc, "append_event", side_effect=fake_append_event
         ), patch("builtins.print"):
             with self.assertRaises(RuntimeError):
@@ -129,12 +155,11 @@ class CameraControlAndPoststimTests(unittest.TestCase):
 
     def test_fetch_rejects_nonpositive_timeout_values(self):
         args = argparse.Namespace(dry_run=False, rsync_timeout_sec=0, ffmpeg_timeout_sec=1.0)
-        state = {
-            "camera_host": "pi@host",
-            "remote_video_dir": "/remote/session/video",
-            "local_video_dir": "/tmp/session/video",
-            "framerate": 30,
-        }
+        state = valid_camera_state(
+            remote_video_dir="/remote/session/video",
+            local_video_dir="/tmp/session/video",
+            framerate=30,
+        )
         with self.assertRaises(ValueError):
             rc.fetch_camera(args, state)
 
@@ -597,15 +622,14 @@ class CameraControlAndPoststimTests(unittest.TestCase):
         args = argparse.Namespace(
             camera_host="pi@host", remote_camera_stop="/repo/stop.sh", ignore_stop_errors=False, dry_run=False
         )
-        state = {
-            "camera_host": "pi@host",
-            "camera_pid": 123,
-            "remote_pid_file": "/remote/camera.pid",
-            "remote_base_path": "/remote/session",
-            "remote_video_dir": "/remote",
-            "remote_log_file": "/remote/camera.log",
-            "local_video_dir": "/tmp/camera-stop-test",
-        }
+        state = valid_camera_state(
+            camera_pid=123,
+            remote_pid_file="/remote/camera.pid",
+            remote_base_path="/remote/session",
+            remote_video_dir="/remote",
+            remote_log_file="/remote/camera.log",
+            local_video_dir="/tmp/camera-stop-test",
+        )
         commands = []
 
         def fake_run_ssh(camera_host, remote_cmd, check=True, dry_run=False, timeout=None):
@@ -627,15 +651,14 @@ class CameraControlAndPoststimTests(unittest.TestCase):
         args = argparse.Namespace(
             camera_host="pi@host", remote_camera_stop="/repo/stop.sh", ignore_stop_errors=True, dry_run=False
         )
-        state = {
-            "camera_host": "pi@host",
-            "camera_pid": 123,
-            "remote_pid_file": "/remote/camera.pid",
-            "remote_base_path": "/remote/session",
-            "remote_video_dir": "/remote",
-            "remote_log_file": "/remote/camera.log",
-            "local_video_dir": "/tmp/camera-stop-ignore-test",
-        }
+        state = valid_camera_state(
+            camera_pid=123,
+            remote_pid_file="/remote/camera.pid",
+            remote_base_path="/remote/session",
+            remote_video_dir="/remote",
+            remote_log_file="/remote/camera.log",
+            local_video_dir="/tmp/camera-stop-ignore-test",
+        )
 
         with patch.object(
             rc, "run_ssh", return_value=subprocess.CompletedProcess(["ssh"], 0, stdout="", stderr="")
@@ -653,5 +676,91 @@ class CameraControlAndPoststimTests(unittest.TestCase):
         self.assertIn("123", command)
         self.assertIn("/remote/session/video/session", command)
         self.assertIn("grep -F", command)
+
+    def test_state_writes_are_atomic_and_namespace_validated(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_path = Path(tmpdir) / ".vstim_natural_camera_session.json"
+            state = valid_camera_state()
+            with patch.object(rc, "STATE_FILE", state_path):
+                rc.save_state(state)
+                loaded = rc.load_state()
+
+            self.assertEqual(loaded["controller_repository"], rc.CONTROLLER_REPOSITORY)
+            self.assertFalse(list(Path(tmpdir).glob("*.tmp")))
+
+    def test_generic_legacy_state_is_rejected_as_ambiguous(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            generic_path = Path(tmpdir) / ".last_remote_camera_session.json"
+            generic_path.write_text(json.dumps({"session_id": "old"}))
+            with patch.object(rc, "STATE_FILE", Path(tmpdir) / ".vstim_natural_camera_session.json"), patch.object(
+                rc, "GENERIC_STATE_FILE", generic_path
+            ), patch.object(rc, "LEGACY_STATE_FILE", Path(tmpdir) / "legacy.json"):
+                with self.assertRaises(rc.CameraStateOwnershipError):
+                    rc.load_state()
+
+    def test_remote_raw_cleanup_uses_fresh_manifest_and_exact_paths(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            local_dir = Path(tmpdir)
+            raw_path = local_dir / "session.h264"
+            mp4_path = local_dir / "session.mp4"
+            raw_path.write_bytes(b"raw-camera-data")
+            mp4_path.write_bytes(b"validated-mp4")
+            digest = hashlib.sha256(raw_path.read_bytes()).hexdigest()
+            manifest = [{
+                "path": "/remote/session/video/session.h264",
+                "filename": "session.h264",
+                "size_bytes": raw_path.stat().st_size,
+                "sha256": digest,
+            }]
+            commands = []
+
+            with patch.object(rc, "fetch_remote_camera_manifest", return_value=manifest), patch.object(
+                rc,
+                "validate_mp4_with_ffprobe",
+                return_value={
+                    "validation_available": True,
+                    "valid": True,
+                    "size_bytes": mp4_path.stat().st_size,
+                    "error": "",
+                },
+            ), patch.object(
+                rc, "run_ssh", side_effect=lambda host, command, **kwargs: commands.append(command)
+            ):
+                result = rc.delete_remote_camera_raw_files(
+                    "pi@host", "/remote/session/video", local_dir, manifest
+                )
+
+            self.assertTrue(result["remote_raw_cleanup_completed"])
+            self.assertIn("/remote/session/video/session.h264", commands[0])
+            self.assertNotIn("rm -f -- /remote/session/video'", commands[0])
+
+    def test_remote_raw_cleanup_refuses_unvalidated_mp4(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            local_dir = Path(tmpdir)
+            raw_path = local_dir / "session.h264"
+            raw_path.write_bytes(b"raw-camera-data")
+            digest = hashlib.sha256(raw_path.read_bytes()).hexdigest()
+            manifest = [{
+                "path": "/remote/session/video/session.h264",
+                "filename": "session.h264",
+                "size_bytes": raw_path.stat().st_size,
+                "sha256": digest,
+            }]
+            with patch.object(rc, "fetch_remote_camera_manifest", return_value=manifest), patch.object(
+                rc,
+                "validate_mp4_with_ffprobe",
+                return_value={
+                    "validation_available": False,
+                    "valid": None,
+                    "size_bytes": 1,
+                    "error": "ffprobe unavailable",
+                },
+            ), patch.object(rc, "run_ssh") as run_mock:
+                with self.assertRaises(RuntimeError):
+                    rc.delete_remote_camera_raw_files(
+                        "pi@host", "/remote/session/video", local_dir, manifest
+                    )
+
+            run_mock.assert_not_called()
 if __name__ == "__main__":
     unittest.main()
