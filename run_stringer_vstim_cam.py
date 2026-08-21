@@ -432,7 +432,7 @@ def prestimulus_result_message(baseline_result):
 
 def make_prestim_gray_event_row(iti_raw_path, baseline_iti_frames, baseline_perf, baseline_timing):
     """Build the prestim gray event using the display request timestamp."""
-    return {
+    row = {
         "utc_iso": baseline_timing["request_utc_iso"],
         "unix_time_utc_sec": baseline_timing["request_unix_sec"],
         "event_type": "prestim_gray_on",
@@ -449,6 +449,14 @@ def make_prestim_gray_event_row(iti_raw_path, baseline_iti_frames, baseline_perf
         "stddev_interframe_us": getattr(baseline_perf, "stddev_interframe", ""),
         "notes": "condition=gray_iti; photodiode=off; screen_opened_before_camera=true",
     }
+    row.update(
+        base.make_display_timing_diagnostic_fields(
+            base.iti_duration_sec(baseline_iti_frames),
+            baseline_timing,
+            planned_display_frames=baseline_iti_frames,
+        )
+    )
+    return row
 
 
 def run_poststim_black_baseline(screen, iti_raw, event_log_path, stimulus_playback_completed=True):
@@ -1021,6 +1029,7 @@ def main():
         "adjacent_repeat_count": adjacent_repeat_count,
         "adjacent_repeat_constraint_satisfied": adjacent_repeat_count == 0,
         "stim_duration_sec": base.STIM_DURATION_SEC,
+        "display_call_duration_semantics": "blocking_rpg_display_raw_wall_time_not_physical_monitor_duration",
         "iti_mode": "uniform_discrete_frames",
         "iti_min_sec": base.ITI_MIN_SEC,
         "iti_max_sec": base.ITI_MAX_SEC,

@@ -71,6 +71,7 @@ EVENT_FIELDS = [
     "image_filename",
     "raw_path",
     "planned_duration_sec",
+    "planned_display_frames",
     "planned_iti_frames",
     "display_request_unix_ns",
     "display_return_unix_ns",
@@ -78,6 +79,8 @@ EVENT_FIELDS = [
     "display_request_perf_counter_ns",
     "display_return_perf_counter_ns",
     "display_call_duration_sec",
+    "display_call_overhead_sec",
+    "display_call_overhead_frames",
     "start_time_unix",
     "mean_interframe_us",
     "stddev_interframe_us",
@@ -446,8 +449,24 @@ def display_raw_with_timing(screen, raw):
     }
 
 
-def make_display_event_row(event_type, trial, raw_path, planned_duration_sec, perf, timing):
+def make_display_timing_diagnostic_fields(planned_duration_sec, timing, planned_display_frames=None):
+    if planned_display_frames is None:
+        planned_display_frames = refreshes_for_seconds(planned_duration_sec)
+    overhead_sec = float(timing["duration_sec"]) - float(planned_duration_sec)
     return {
+        "planned_display_frames": int(planned_display_frames),
+        "display_call_overhead_sec": "%.9f" % overhead_sec,
+        "display_call_overhead_frames": "%.6f" % (overhead_sec * REFRESH_RATE_HZ),
+    }
+
+
+def make_display_event_row(event_type, trial, raw_path, planned_duration_sec, perf, timing):
+    planned_display_frames = (
+        trial.get("planned_iti_frames", refreshes_for_seconds(planned_duration_sec))
+        if event_type == "iti_on"
+        else refreshes_for_seconds(STIM_DURATION_SEC)
+    )
+    row = {
         "utc_iso": timing["request_utc_iso"],
         "unix_time_utc_sec": timing["request_unix_sec"],
         "event_type": event_type,
@@ -470,6 +489,8 @@ def make_display_event_row(event_type, trial, raw_path, planned_duration_sec, pe
         "stddev_interframe_us": getattr(perf, "stddev_interframe", ""),
         "notes": "",
     }
+    row.update(make_display_timing_diagnostic_fields(planned_duration_sec, timing, planned_display_frames))
+    return row
 
 
 def run_trial_sequence(
@@ -764,6 +785,7 @@ def main():
         "adjacent_repeat_count": adjacent_repeat_count,
         "adjacent_repeat_constraint_satisfied": adjacent_repeat_count == 0,
         "stim_duration_sec": STIM_DURATION_SEC,
+        "display_call_duration_semantics": "blocking_rpg_display_raw_wall_time_not_physical_monitor_duration",
         "iti_mode": "uniform_discrete_frames",
         "iti_min_sec": ITI_MIN_SEC,
         "iti_max_sec": ITI_MAX_SEC,

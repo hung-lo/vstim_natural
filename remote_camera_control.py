@@ -64,7 +64,8 @@ CAMERA_OUTPUT_MIN_BYTES = 1
 CAMERA_OUTPUT_GLOB = "*.h264"
 CAMERA_RAW_VIDEO_PATTERNS = ("*.h264",)
 CAMERA_RSYNC_TIMEOUT_SEC = 300.0
-CAMERA_FFMPEG_TIMEOUT_SEC = 120.0
+CAMERA_FFMPEG_TIMEOUT_SEC = 600.0
+CAMERA_MP4_FASTSTART = False
 CAMERA_STOP_TIMEOUT_SEC = 10.0
 CAMERA_PREVIEW_LAUNCH_TIMEOUT_SEC = 10.0
 CAMERA_STOP_VERIFY_TIMEOUT_SEC = 8.0
@@ -462,14 +463,51 @@ def verify_local_camera_raw_files(local_video_dir):
     return raw_files
 
 
-def convert_h264_to_mp4(local_video_dir, framerate=CAMERA_FRAMERATE, dry_run=False, timeout_sec=CAMERA_FFMPEG_TIMEOUT_SEC):
+class ConversionFailure(RuntimeError):
+    """Conversion failed after preserving the raw input and attempt details."""
+
+    def __init__(self, message, conversion_result):
+        super().__init__(message)
+        self.conversion_result = conversion_result
+
+
+def _file_size_bytes(path):
+    try:
+        return path.stat().st_size
+    except OSError:
+        return 0
+
+
+def _raw_file_is_present(path):
+    return path.is_file() and _file_size_bytes(path) > 0
+
+
+def _delete_partial_mp4(output_path):
+    if not output_path.exists():
+        return False
+    try:
+        output_path.unlink()
+    except OSError:
+        return False
+    return True
+
+
+def convert_h264_to_mp4(
+    local_video_dir,
+    framerate=CAMERA_FRAMERATE,
+    dry_run=False,
+    timeout_sec=CAMERA_FFMPEG_TIMEOUT_SEC,
+    faststart=CAMERA_MP4_FASTSTART,
+    event_callback=None,
+):
+    """Remux raw H.264 to MP4 while never modifying the raw input files."""
     ffmpeg = shutil.which("ffmpeg")
     if ffmpeg is None:
         raise RuntimeError(
             "FFmpeg is not installed or not available on PATH; raw .h264 files were fetched but MP4 conversion could not run."
         )
 
-    h264_files = verify_local_camera_raw_files(local_video_dir)
+    h264_files = verify_local_camera_raw_files(Path(local_video_dir))
     result = {
         "conversion_attempted": False,
         "conversion_completed": False,
@@ -477,6 +515,9 @@ def convert_h264_to_mp4(local_video_dir, framerate=CAMERA_FRAMERATE, dry_run=Fal
         "conversion_skip_reason": None,
         "input_files": [str(path) for path in h264_files],
         "output_files": [],
+        "conversion_attempts": [],
+        "ffmpeg_timeout_sec": timeout_sec,
+        "faststart_enabled": bool(faststart),
     }
 
     if dry_run:
@@ -484,16 +525,38 @@ def convert_h264_to_mp4(local_video_dir, framerate=CAMERA_FRAMERATE, dry_run=Fal
         result["conversion_skip_reason"] = "dry_run"
         return result
 
+    attempt_number = 0
     for input_path in h264_files:
         output_path = input_path.with_suffix(".mp4")
+        partial_mp4_deleted = False
         if output_path.exists():
-            if output_path.stat().st_size <= 0:
-                raise RuntimeError("Existing MP4 file is empty: %s" % output_path)
-            print("MP4 already exists, skipping: %s" % output_path)
-            result["output_files"].append(str(output_path))
-            continue
+            if _file_size_bytes(output_path) > 0:
+                print("MP4 already exists, skipping: %s" % output_path)
+                result["output_files"].append(str(output_path))
+                continue
+            partial_mp4_deleted = _delete_partial_mp4(output_path)
 
+        attempt_number += 1
+        input_size_bytes = _file_size_bytes(input_path)
+        attempt = {
+            "input_h264_path": str(input_path),
+            "output_mp4_path": str(output_path),
+            "input_size_bytes": input_size_bytes,
+            "output_size_bytes": 0,
+            "ffmpeg_timeout_sec": timeout_sec,
+            "faststart_enabled": bool(faststart),
+            "conversion_elapsed_sec": 0.0,
+            "attempt_number": attempt_number,
+            "ffmpeg_return_code": None,
+            "raw_h264_still_present": _raw_file_is_present(input_path),
+            "partial_mp4_deleted": partial_mp4_deleted,
+            "error_message": "",
+            "reason": "",
+        }
         result["conversion_attempted"] = True
+        if event_callback is not None:
+            event_callback("camera_conversion_started", dict(attempt))
+
         cmd = [
             ffmpeg,
             "-y",
@@ -503,35 +566,95 @@ def convert_h264_to_mp4(local_video_dir, framerate=CAMERA_FRAMERATE, dry_run=Fal
             str(input_path),
             "-c:v",
             "copy",
-            "-movflags",
-            "+faststart",
-            str(output_path),
         ]
+        if faststart:
+            cmd.extend(["-movflags", "+faststart"])
+        cmd.append(str(output_path))
         print("+ " + " ".join(shlex.quote(x) for x in cmd))
+
+        started = time.monotonic()
         try:
-            subprocess.run(cmd, check=True, text=True, capture_output=True, timeout=timeout_sec)
+            completed = subprocess.run(
+                cmd,
+                check=True,
+                text=True,
+                capture_output=True,
+                timeout=timeout_sec,
+            )
         except subprocess.TimeoutExpired as exc:
-            if output_path.exists():
-                output_path.unlink()
+            attempt["conversion_elapsed_sec"] = time.monotonic() - started
+            attempt["reason"] = "timeout"
+            attempt["error_message"] = "MP4 conversion timed out after %.1f seconds for %s" % (
+                timeout_sec,
+                input_path.name,
+            )
+            attempt["partial_mp4_deleted"] = _delete_partial_mp4(output_path) or partial_mp4_deleted
+            attempt["raw_h264_still_present"] = _raw_file_is_present(input_path)
+            result["conversion_attempts"].append(dict(attempt))
+            if event_callback is not None:
+                event_callback("camera_conversion_failed", dict(attempt))
             print_subprocess_output(exc.stdout, exc.stderr)
-            raise RuntimeError("MP4 conversion timed out after %.1f seconds for %s" % (timeout_sec, input_path.name)) from exc
+            raise ConversionFailure(attempt["error_message"], result) from exc
         except subprocess.CalledProcessError as exc:
+            attempt["conversion_elapsed_sec"] = time.monotonic() - started
+            attempt["reason"] = "ffmpeg_nonzero_return"
+            attempt["ffmpeg_return_code"] = exc.returncode
+            attempt["error_message"] = "FFmpeg returned nonzero exit status %s for %s" % (
+                exc.returncode,
+                input_path.name,
+            )
+            attempt["partial_mp4_deleted"] = _delete_partial_mp4(output_path) or partial_mp4_deleted
+            attempt["raw_h264_still_present"] = _raw_file_is_present(input_path)
+            result["conversion_attempts"].append(dict(attempt))
+            if event_callback is not None:
+                event_callback("camera_conversion_failed", dict(attempt))
             print_subprocess_output(exc.stdout, exc.stderr)
-            raise
+            raise ConversionFailure(attempt["error_message"], result) from exc
+        except KeyboardInterrupt as exc:
+            attempt["conversion_elapsed_sec"] = time.monotonic() - started
+            attempt["reason"] = "interrupted"
+            attempt["error_message"] = "MP4 conversion interrupted for %s" % input_path.name
+            attempt["partial_mp4_deleted"] = _delete_partial_mp4(output_path) or partial_mp4_deleted
+            attempt["raw_h264_still_present"] = _raw_file_is_present(input_path)
+            result["conversion_attempts"].append(dict(attempt))
+            if event_callback is not None:
+                event_callback("camera_conversion_failed", dict(attempt))
+            raise ConversionFailure(attempt["error_message"], result) from exc
 
-        if not output_path.exists():
-            raise RuntimeError("FFmpeg returned successfully but did not create %s" % output_path)
-        if output_path.stat().st_size <= 0:
-            raise RuntimeError("FFmpeg created an empty MP4 file: %s" % output_path)
+        attempt["conversion_elapsed_sec"] = time.monotonic() - started
+        attempt["ffmpeg_return_code"] = completed.returncode
+        if not output_path.exists() or _file_size_bytes(output_path) <= 0:
+            attempt["reason"] = "invalid_output"
+            attempt["error_message"] = "FFmpeg returned successfully but did not create a non-empty MP4: %s" % output_path
+            attempt["partial_mp4_deleted"] = _delete_partial_mp4(output_path) or partial_mp4_deleted
+            attempt["raw_h264_still_present"] = _raw_file_is_present(input_path)
+            result["conversion_attempts"].append(dict(attempt))
+            if event_callback is not None:
+                event_callback("camera_conversion_failed", dict(attempt))
+            raise ConversionFailure(attempt["error_message"], result)
 
+        attempt["output_size_bytes"] = _file_size_bytes(output_path)
+        attempt["raw_h264_still_present"] = _raw_file_is_present(input_path)
+        result["conversion_attempts"].append(dict(attempt))
         result["output_files"].append(str(output_path))
+        if event_callback is not None:
+            completed_attempt = dict(attempt)
+            completed_attempt["error_message"] = ""
+            event_callback("camera_conversion_completed", completed_attempt)
         print("Converted %s -> %s" % (input_path.name, output_path.name))
 
     result["conversion_completed"] = bool(result["output_files"]) and len(result["output_files"]) == len(h264_files)
     return result
 
 
-def run_camera_conversion_workflow(camera_host, local_video_dir, framerate=CAMERA_FRAMERATE, dry_run=False, timeout_sec=CAMERA_FFMPEG_TIMEOUT_SEC):
+def run_camera_conversion_workflow(
+    camera_host,
+    local_video_dir,
+    framerate=CAMERA_FRAMERATE,
+    dry_run=False,
+    timeout_sec=CAMERA_FFMPEG_TIMEOUT_SEC,
+    faststart=CAMERA_MP4_FASTSTART,
+):
     local_video_dir = Path(local_video_dir)
     result = {
         "camera_raw_files_verified": False,
@@ -544,6 +667,8 @@ def run_camera_conversion_workflow(camera_host, local_video_dir, framerate=CAMER
         "camera_conversion_skip_reason": "",
         "converted_mp4_files": [],
         "conversion_result": None,
+        "conversion_attempts": [],
+        "camera_mp4_faststart": bool(faststart),
     }
 
     try:
@@ -590,22 +715,20 @@ def run_camera_conversion_workflow(camera_host, local_video_dir, framerate=CAMER
                 "local_video_dir": str(local_video_dir),
                 "reason": "ffmpeg_not_available",
                 "raw_h264_available_locally": True,
+                "raw_h264_still_present": all(_raw_file_is_present(path) for path in raw_files),
                 "error": error,
             },
         )
         print(error, file=sys.stderr)
         return result
 
-    append_event(
-        local_video_dir,
-        "camera_conversion_started",
-        {
+    def record_conversion_event(event, details):
+        event_details = {
             "camera_host": camera_host,
             "local_video_dir": str(local_video_dir),
-            "ffmpeg_timeout_sec": timeout_sec,
-            "raw_file_count": len(raw_files),
-        },
-    )
+        }
+        event_details.update(details)
+        append_event(local_video_dir, event, event_details)
 
     try:
         conversion_result = convert_h264_to_mp4(
@@ -613,11 +736,26 @@ def run_camera_conversion_workflow(camera_host, local_video_dir, framerate=CAMER
             framerate=framerate,
             dry_run=dry_run,
             timeout_sec=timeout_sec,
+            faststart=faststart,
+            event_callback=record_conversion_event,
         )
-    except Exception as exc:
-        result["camera_conversion_attempted"] = True
+    except ConversionFailure as exc:
+        conversion_result = exc.conversion_result
+        result["conversion_result"] = conversion_result
+        result["conversion_attempts"] = list(conversion_result.get("conversion_attempts", []))
+        result["camera_conversion_attempted"] = bool(result["conversion_attempts"])
         result["camera_conversion_deferred"] = True
         result["camera_conversion_error"] = str(exc)
+        failed_attempt = result["conversion_attempts"][-1] if result["conversion_attempts"] else {}
+        result["camera_conversion_skip_reason"] = failed_attempt.get("reason", "conversion_failed")
+        result["raw_h264_still_present"] = all(_raw_file_is_present(path) for path in raw_files)
+        print("MP4 conversion did not complete.", file=sys.stderr)
+        return result
+    except Exception as exc:
+        result["camera_conversion_deferred"] = True
+        result["camera_conversion_error"] = str(exc)
+        result["camera_conversion_skip_reason"] = "conversion_failed"
+        result["raw_h264_still_present"] = all(_raw_file_is_present(path) for path in raw_files)
         append_event(
             local_video_dir,
             "camera_conversion_failed",
@@ -625,31 +763,29 @@ def run_camera_conversion_workflow(camera_host, local_video_dir, framerate=CAMER
                 "camera_host": camera_host,
                 "local_video_dir": str(local_video_dir),
                 "ffmpeg_timeout_sec": timeout_sec,
-                "error": str(exc),
+                "faststart_enabled": bool(faststart),
+                "conversion_elapsed_sec": 0.0,
+                "attempt_number": 0,
+                "ffmpeg_return_code": None,
+                "raw_h264_still_present": result["raw_h264_still_present"],
+                "partial_mp4_deleted": False,
+                "error_message": str(exc),
+                "reason": "conversion_failed",
             },
         )
         print("MP4 conversion did not complete.", file=sys.stderr)
         return result
 
     result["conversion_result"] = conversion_result
+    result["conversion_attempts"] = list(conversion_result.get("conversion_attempts", []))
     result["camera_conversion_attempted"] = bool(conversion_result.get("conversion_attempted"))
     result["camera_conversion_completed"] = bool(conversion_result.get("conversion_completed"))
     result["camera_conversion_deferred"] = bool(conversion_result.get("conversion_skipped"))
     result["camera_conversion_skip_reason"] = conversion_result.get("conversion_skip_reason") or ""
     result["converted_mp4_files"] = list(conversion_result.get("output_files", []))
+    result["raw_h264_still_present"] = all(_raw_file_is_present(path) for path in raw_files)
 
-    if result["camera_conversion_completed"]:
-        append_event(
-            local_video_dir,
-            "camera_conversion_completed",
-            {
-                "camera_host": camera_host,
-                "local_video_dir": str(local_video_dir),
-                "converted_mp4_files": result["converted_mp4_files"],
-                "raw_file_count": len(raw_files),
-            },
-        )
-    else:
+    if not result["camera_conversion_completed"]:
         append_event(
             local_video_dir,
             "camera_conversion_deferred",
@@ -658,11 +794,12 @@ def run_camera_conversion_workflow(camera_host, local_video_dir, framerate=CAMER
                 "local_video_dir": str(local_video_dir),
                 "reason": result["camera_conversion_skip_reason"] or "dry_run",
                 "raw_h264_available_locally": True,
+                "raw_h264_still_present": result["raw_h264_still_present"],
+                "faststart_enabled": bool(faststart),
             },
         )
 
     return result
-
 
 def append_event(local_video_dir, event, details=None):
     local_video_dir.mkdir(parents=True, exist_ok=True)
