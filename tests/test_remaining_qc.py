@@ -27,6 +27,14 @@ import remote_camera_control as rc
 import run_stringer_vstim as base
 
 
+
+
+def valid_ffprobe_json():
+    return json.dumps({
+        "streams": [{"codec_name": "h264", "width": 1024, "height": 600, "duration": "12.5"}],
+        "format": {"duration": "12.5", "size": "9"},
+    })
+
 def display_timing(duration_sec):
     return {
         "request_utc_iso": "2026-01-01T00:00:00.000000000+00:00",
@@ -52,6 +60,8 @@ class RemainingQcTests(unittest.TestCase):
             captured = {}
 
             def fake_run(cmd, **kwargs):
+                if "-select_streams" in cmd:
+                    return subprocess.CompletedProcess(cmd, 0, stdout=valid_ffprobe_json(), stderr="")
                 captured["cmd"] = cmd
                 captured["kwargs"] = kwargs
                 Path(cmd[-1]).write_bytes(b"valid-mp4")
@@ -118,6 +128,8 @@ class RemainingQcTests(unittest.TestCase):
             events = []
 
             def fake_run(cmd, **kwargs):
+                if "-select_streams" in cmd:
+                    return subprocess.CompletedProcess(cmd, 0, stdout=valid_ffprobe_json(), stderr="")
                 Path(cmd[-1]).write_bytes(b"valid-mp4")
                 return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
 
@@ -164,6 +176,98 @@ class RemainingQcTests(unittest.TestCase):
             self.assertFalse(mp4_path.exists())
             self.assertTrue(raw_path.exists())
 
+    def test_existing_valid_mp4_is_skipped_after_ffprobe_validation(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            directory = Path(tmpdir)
+            raw_path = directory / "session.h264"
+            mp4_path = directory / "session.mp4"
+            raw_path.write_bytes(b"raw-h264")
+            mp4_path.write_bytes(b"existing-mp4")
+            events = []
+
+            def fake_run(cmd, **kwargs):
+                self.assertIn("-select_streams", cmd)
+                return subprocess.CompletedProcess(cmd, 0, stdout=valid_ffprobe_json(), stderr="")
+
+            with patch.object(rc.shutil, "which", return_value="/usr/bin/ffprobe"), patch.object(
+                rc.subprocess, "run", side_effect=fake_run
+            ):
+                result = rc.convert_h264_to_mp4(
+                    directory,
+                    event_callback=lambda event, details: events.append((event, details)),
+                )
+
+            self.assertTrue(result["conversion_completed"])
+            self.assertFalse(result["conversion_attempted"])
+            self.assertEqual(events[0][0], "camera_conversion_skipped_existing_valid")
+            self.assertTrue(events[0][1]["ffprobe_valid"])
+            self.assertEqual(events[0][1]["video_stream_count"], 1)
+            self.assertTrue(raw_path.exists())
+            self.assertTrue(mp4_path.exists())
+
+    def test_existing_invalid_mp4_is_removed_and_reconverted(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            directory = Path(tmpdir)
+            raw_path = directory / "session.h264"
+            mp4_path = directory / "session.mp4"
+            raw_path.write_bytes(b"raw-h264")
+            mp4_path.write_bytes(b"invalid-mp4")
+            events = []
+            calls = []
+
+            def fake_run(cmd, **kwargs):
+                calls.append(cmd[0])
+                if "-select_streams" in cmd:
+                    if calls.count(cmd[0]) == 1:
+                        return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="invalid")
+                    return subprocess.CompletedProcess(cmd, 0, stdout=valid_ffprobe_json(), stderr="")
+                mp4_path.write_bytes(b"new-mp4")
+                return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+            with patch.object(rc.shutil, "which", return_value="/usr/bin/ffprobe"), patch.object(
+                rc.subprocess, "run", side_effect=fake_run
+            ):
+                result = rc.convert_h264_to_mp4(
+                    directory,
+                    event_callback=lambda event, details: events.append((event, details)),
+                )
+
+            self.assertTrue(result["conversion_completed"])
+            self.assertTrue(result["conversion_attempted"])
+            invalid = next(details for event, details in events if event == "camera_conversion_existing_invalid")
+            self.assertTrue(invalid["existing_mp4_invalid"])
+            self.assertTrue(invalid["existing_mp4_removed"])
+            self.assertTrue(any(event == "camera_conversion_completed" for event, _ in events))
+            self.assertTrue(raw_path.exists())
+            self.assertTrue(mp4_path.exists())
+
+    def test_ffmpeg_success_but_ffprobe_failure_does_not_complete_conversion(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            directory = Path(tmpdir)
+            raw_path = directory / "session.h264"
+            mp4_path = directory / "session.mp4"
+            raw_path.write_bytes(b"raw-h264")
+            events = []
+
+            def fake_run(cmd, **kwargs):
+                if "-select_streams" in cmd:
+                    return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="bad mp4")
+                mp4_path.write_bytes(b"invalid-output")
+                return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+            with patch.object(rc.shutil, "which", return_value="/usr/bin/ffprobe"), patch.object(
+                rc.subprocess, "run", side_effect=fake_run
+            ), patch.object(
+                rc, "append_event", side_effect=lambda path, event, details=None: events.append((event, details or {}))
+            ):
+                result = rc.run_camera_conversion_workflow("pi@host", directory)
+
+            self.assertFalse(result["camera_conversion_completed"])
+            self.assertTrue(result["raw_h264_still_present"])
+            self.assertFalse(mp4_path.exists())
+            self.assertEqual(result["camera_conversion_skip_reason"], "ffprobe_validation_failed")
+
+
     def test_display_timing_diagnostics_are_frame_based_and_non_compensating(self):
         trial = {
             "trial_index": 0,
@@ -180,6 +284,7 @@ class RemainingQcTests(unittest.TestCase):
         iti_row = base.make_display_event_row("iti_on", trial, "/tmp/iti.raw", 51 / 60.0, perf, display_timing(0.867))
 
         self.assertEqual(stim_row["planned_display_frames"], 30)
+        self.assertEqual(stim_row["event_unix_ns"], 1767225600000000000)
         self.assertAlmostEqual(float(stim_row["display_call_overhead_sec"]), 0.016)
         self.assertAlmostEqual(float(stim_row["display_call_overhead_frames"]), 0.96)
         self.assertEqual(iti_row["planned_display_frames"], 51)

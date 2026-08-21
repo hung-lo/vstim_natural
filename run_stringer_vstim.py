@@ -60,9 +60,13 @@ USE_GPIO = False
 TTL_PIN_BCM = 23
 TTL_PULSE_SEC = 0.005
 
+# event_unix_ns is the canonical exact timestamp for the event represented by a row.
+# display_request_unix_ns is specifically captured immediately before RPG display_raw().
+# display_return_unix_ns is captured immediately after RPG display_raw() returns.
 EVENT_FIELDS = [
     "utc_iso",
     "unix_time_utc_sec",
+    "event_unix_ns",
     "event_type",
     "trial_index",
     "repeat_number",
@@ -469,6 +473,7 @@ def make_display_event_row(event_type, trial, raw_path, planned_duration_sec, pe
     row = {
         "utc_iso": timing["request_utc_iso"],
         "unix_time_utc_sec": timing["request_unix_sec"],
+        "event_unix_ns": timing["request_unix_ns"],
         "event_type": event_type,
         "trial_index": trial["trial_index"],
         "repeat_number": trial["repeat_number"],

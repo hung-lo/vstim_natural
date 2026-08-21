@@ -25,6 +25,7 @@ You can still override the host manually with:
 import argparse
 import csv
 import json
+import math
 import re
 import shutil
 import shlex
@@ -66,6 +67,7 @@ CAMERA_RAW_VIDEO_PATTERNS = ("*.h264",)
 CAMERA_RSYNC_TIMEOUT_SEC = 300.0
 CAMERA_FFMPEG_TIMEOUT_SEC = 600.0
 CAMERA_MP4_FASTSTART = False
+CAMERA_FFPROBE_TIMEOUT_SEC = 30.0
 CAMERA_STOP_TIMEOUT_SEC = 10.0
 CAMERA_PREVIEW_LAUNCH_TIMEOUT_SEC = 10.0
 CAMERA_STOP_VERIFY_TIMEOUT_SEC = 8.0
@@ -492,6 +494,117 @@ def _delete_partial_mp4(output_path):
     return True
 
 
+def validate_mp4_with_ffprobe(mp4_path, timeout_sec=CAMERA_FFPROBE_TIMEOUT_SEC):
+    """Validate an MP4 container quickly without decoding the video."""
+    mp4_path = Path(mp4_path)
+    result = {
+        "valid": False,
+        "return_code": None,
+        "duration_sec": None,
+        "size_bytes": _file_size_bytes(mp4_path),
+        "video_stream_count": 0,
+        "error": "",
+    }
+    if result["size_bytes"] <= 0:
+        result["error"] = "MP4 file is missing or empty."
+        return result
+
+    ffprobe = shutil.which("ffprobe")
+    if ffprobe is None:
+        result["error"] = "ffprobe is not installed or not available on PATH."
+        return result
+
+    cmd = [
+        ffprobe,
+        "-v",
+        "error",
+        "-select_streams",
+        "v:0",
+        "-show_entries",
+        "stream=codec_name,width,height,r_frame_rate,duration",
+        "-show_entries",
+        "format=duration,size",
+        "-of",
+        "json",
+        str(mp4_path),
+    ]
+    try:
+        completed = subprocess.run(
+            cmd,
+            check=False,
+            text=True,
+            capture_output=True,
+            timeout=timeout_sec,
+        )
+    except subprocess.TimeoutExpired as exc:
+        result["error"] = "ffprobe validation timed out after %.1f seconds." % timeout_sec
+        return result
+    except OSError as exc:
+        result["error"] = "Could not run ffprobe: %s" % exc
+        return result
+
+    result["return_code"] = completed.returncode
+    if completed.returncode != 0:
+        stderr = tail_text(subprocess_output_to_text(completed.stderr)).strip()
+        result["error"] = "ffprobe returned exit status %s%s" % (
+            completed.returncode,
+            ": %s" % stderr if stderr else "",
+        )
+        return result
+
+    try:
+        payload = json.loads(subprocess_output_to_text(completed.stdout) or "{}")
+    except (TypeError, ValueError) as exc:
+        result["error"] = "ffprobe returned invalid JSON: %s" % exc
+        return result
+
+    streams = payload.get("streams") or []
+    result["video_stream_count"] = len(streams)
+    if not streams:
+        result["error"] = "ffprobe found no video stream."
+        return result
+
+    duration_value = None
+    stream_duration = streams[0].get("duration") if streams else None
+    format_duration = (payload.get("format") or {}).get("duration")
+    for candidate in (stream_duration, format_duration):
+        if candidate not in (None, "", "N/A"):
+            duration_value = candidate
+            break
+    if duration_value is not None:
+        try:
+            duration_value = float(duration_value)
+        except (TypeError, ValueError):
+            result["error"] = "ffprobe reported a non-numeric duration."
+            return result
+        if not math.isfinite(duration_value) or duration_value <= 0:
+            result["error"] = "ffprobe reported an invalid duration: %s" % duration_value
+            return result
+        result["duration_sec"] = duration_value
+
+    result["valid"] = True
+    return result
+
+
+class ConversionFailure(RuntimeError):
+    """Conversion failed after preserving the raw input and attempt details."""
+
+    def __init__(self, message, conversion_result):
+        super().__init__(message)
+        self.conversion_result = conversion_result
+
+
+def _file_size_bytes(path):
+    try:
+        return path.stat().st_size
+    except OSError:
+        return 0
+
+
+def _raw_file_is_present(path):
+    return path.is_file() and _file_size_bytes(path) > 0
+
+
 def convert_h264_to_mp4(
     local_video_dir,
     framerate=CAMERA_FRAMERATE,
@@ -516,8 +629,10 @@ def convert_h264_to_mp4(
         "input_files": [str(path) for path in h264_files],
         "output_files": [],
         "conversion_attempts": [],
+        "validated_mp4_files": [],
         "ffmpeg_timeout_sec": timeout_sec,
         "faststart_enabled": bool(faststart),
+        "ffprobe_timeout_sec": CAMERA_FFPROBE_TIMEOUT_SEC,
     }
 
     if dry_run:
@@ -525,15 +640,50 @@ def convert_h264_to_mp4(
         result["conversion_skip_reason"] = "dry_run"
         return result
 
+    def emit(event, details):
+        if event_callback is not None:
+            event_callback(event, dict(details))
+
     attempt_number = 0
     for input_path in h264_files:
         output_path = input_path.with_suffix(".mp4")
         partial_mp4_deleted = False
-        if output_path.exists():
-            if _file_size_bytes(output_path) > 0:
-                print("MP4 already exists, skipping: %s" % output_path)
+        if output_path.exists() and _file_size_bytes(output_path) > 0:
+            existing_validation = validate_mp4_with_ffprobe(output_path)
+            if existing_validation["valid"]:
+                print("Valid MP4 already exists, skipping: %s" % output_path)
                 result["output_files"].append(str(output_path))
+                result["validated_mp4_files"].append(str(output_path))
+                emit(
+                    "camera_conversion_skipped_existing_valid",
+                    {
+                        "mp4_path": str(output_path),
+                        "mp4_size_bytes": existing_validation["size_bytes"],
+                        "ffprobe_valid": True,
+                        "duration_sec": existing_validation["duration_sec"],
+                        "video_stream_count": existing_validation["video_stream_count"],
+                        "ffprobe_return_code": existing_validation["return_code"],
+                    },
+                )
                 continue
+
+            partial_mp4_deleted = _delete_partial_mp4(output_path)
+            emit(
+                "camera_conversion_existing_invalid",
+                {
+                    "mp4_path": str(output_path),
+                    "mp4_size_bytes": existing_validation["size_bytes"],
+                    "ffprobe_valid": False,
+                    "duration_sec": existing_validation["duration_sec"],
+                    "video_stream_count": existing_validation["video_stream_count"],
+                    "ffprobe_return_code": existing_validation["return_code"],
+                    "error_message": existing_validation["error"],
+                    "existing_mp4_invalid": True,
+                    "existing_mp4_removed": partial_mp4_deleted,
+                    "raw_h264_still_present": _raw_file_is_present(input_path),
+                },
+            )
+        elif output_path.exists():
             partial_mp4_deleted = _delete_partial_mp4(output_path)
 
         attempt_number += 1
@@ -552,10 +702,13 @@ def convert_h264_to_mp4(
             "partial_mp4_deleted": partial_mp4_deleted,
             "error_message": "",
             "reason": "",
+            "ffprobe_valid": False,
+            "ffprobe_return_code": None,
+            "duration_sec": None,
+            "video_stream_count": 0,
         }
         result["conversion_attempted"] = True
-        if event_callback is not None:
-            event_callback("camera_conversion_started", dict(attempt))
+        emit("camera_conversion_started", attempt)
 
         cmd = [
             ffmpeg,
@@ -591,8 +744,7 @@ def convert_h264_to_mp4(
             attempt["partial_mp4_deleted"] = _delete_partial_mp4(output_path) or partial_mp4_deleted
             attempt["raw_h264_still_present"] = _raw_file_is_present(input_path)
             result["conversion_attempts"].append(dict(attempt))
-            if event_callback is not None:
-                event_callback("camera_conversion_failed", dict(attempt))
+            emit("camera_conversion_failed", attempt)
             print_subprocess_output(exc.stdout, exc.stderr)
             raise ConversionFailure(attempt["error_message"], result) from exc
         except subprocess.CalledProcessError as exc:
@@ -606,8 +758,7 @@ def convert_h264_to_mp4(
             attempt["partial_mp4_deleted"] = _delete_partial_mp4(output_path) or partial_mp4_deleted
             attempt["raw_h264_still_present"] = _raw_file_is_present(input_path)
             result["conversion_attempts"].append(dict(attempt))
-            if event_callback is not None:
-                event_callback("camera_conversion_failed", dict(attempt))
+            emit("camera_conversion_failed", attempt)
             print_subprocess_output(exc.stdout, exc.stderr)
             raise ConversionFailure(attempt["error_message"], result) from exc
         except KeyboardInterrupt as exc:
@@ -617,8 +768,7 @@ def convert_h264_to_mp4(
             attempt["partial_mp4_deleted"] = _delete_partial_mp4(output_path) or partial_mp4_deleted
             attempt["raw_h264_still_present"] = _raw_file_is_present(input_path)
             result["conversion_attempts"].append(dict(attempt))
-            if event_callback is not None:
-                event_callback("camera_conversion_failed", dict(attempt))
+            emit("camera_conversion_failed", attempt)
             raise ConversionFailure(attempt["error_message"], result) from exc
 
         attempt["conversion_elapsed_sec"] = time.monotonic() - started
@@ -629,23 +779,34 @@ def convert_h264_to_mp4(
             attempt["partial_mp4_deleted"] = _delete_partial_mp4(output_path) or partial_mp4_deleted
             attempt["raw_h264_still_present"] = _raw_file_is_present(input_path)
             result["conversion_attempts"].append(dict(attempt))
-            if event_callback is not None:
-                event_callback("camera_conversion_failed", dict(attempt))
+            emit("camera_conversion_failed", attempt)
             raise ConversionFailure(attempt["error_message"], result)
 
-        attempt["output_size_bytes"] = _file_size_bytes(output_path)
+        validation = validate_mp4_with_ffprobe(output_path)
+        attempt["ffprobe_valid"] = validation["valid"]
+        attempt["ffprobe_return_code"] = validation["return_code"]
+        attempt["duration_sec"] = validation["duration_sec"]
+        attempt["video_stream_count"] = validation["video_stream_count"]
+        attempt["output_size_bytes"] = validation["size_bytes"]
+        if not validation["valid"]:
+            attempt["reason"] = "ffprobe_validation_failed"
+            attempt["error_message"] = validation["error"] or "ffprobe rejected the generated MP4."
+            emit("camera_conversion_validation_failed", attempt)
+            attempt["partial_mp4_deleted"] = _delete_partial_mp4(output_path) or partial_mp4_deleted
+            attempt["raw_h264_still_present"] = _raw_file_is_present(input_path)
+            result["conversion_attempts"].append(dict(attempt))
+            emit("camera_conversion_failed", attempt)
+            raise ConversionFailure(attempt["error_message"], result)
+
         attempt["raw_h264_still_present"] = _raw_file_is_present(input_path)
         result["conversion_attempts"].append(dict(attempt))
         result["output_files"].append(str(output_path))
-        if event_callback is not None:
-            completed_attempt = dict(attempt)
-            completed_attempt["error_message"] = ""
-            event_callback("camera_conversion_completed", completed_attempt)
+        result["validated_mp4_files"].append(str(output_path))
+        emit("camera_conversion_completed", attempt)
         print("Converted %s -> %s" % (input_path.name, output_path.name))
 
     result["conversion_completed"] = bool(result["output_files"]) and len(result["output_files"]) == len(h264_files)
     return result
-
 
 def run_camera_conversion_workflow(
     camera_host,

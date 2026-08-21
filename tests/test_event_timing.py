@@ -115,6 +115,27 @@ class EventTimingTests(unittest.TestCase):
         self.assertEqual(row["display_return_utc_iso"], timing["return_utc_iso"])
 
 
+    def test_prestim_baseline_end_uses_generic_exact_event_timestamp(self):
+        baseline_result = {
+            "end_reason": "timer_elapsed",
+            "requested_sec": 60.0,
+            "camera_baseline_elapsed_sec": 60.0,
+            "gray_elapsed_sec": 60.0,
+            "forced": False,
+            "waited_for_minimum_gray_after_override": False,
+        }
+        gate_timestamp = {
+            "utc_iso": "2026-01-01T00:01:00.000000000+00:00",
+            "unix_sec": "1767225660.000000000",
+            "unix_ns": 1767225660000000000,
+        }
+
+        row = cam.make_prestim_baseline_end_event_row(baseline_result, gate_timestamp)
+
+        self.assertEqual(row["event_unix_ns"], gate_timestamp["unix_ns"])
+        self.assertNotIn("display_request_unix_ns", row)
+
+
     def test_run_trial_sequence_logs_stim_then_iti_without_interleaving(self):
         call_order = []
         rows = []

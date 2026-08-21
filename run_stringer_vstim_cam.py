@@ -435,6 +435,7 @@ def make_prestim_gray_event_row(iti_raw_path, baseline_iti_frames, baseline_perf
     row = {
         "utc_iso": baseline_timing["request_utc_iso"],
         "unix_time_utc_sec": baseline_timing["request_unix_sec"],
+        "event_unix_ns": baseline_timing["request_unix_ns"],
         "event_type": "prestim_gray_on",
         "raw_path": str(iti_raw_path),
         "planned_duration_sec": base.iti_duration_sec(baseline_iti_frames),
@@ -457,6 +458,25 @@ def make_prestim_gray_event_row(iti_raw_path, baseline_iti_frames, baseline_perf
         )
     )
     return row
+
+
+def make_prestim_baseline_end_event_row(baseline_result, gate_timestamp):
+    """Build the gate event with a generic exact timestamp, not a display timestamp."""
+    return {
+        "utc_iso": gate_timestamp["utc_iso"],
+        "unix_time_utc_sec": gate_timestamp["unix_sec"],
+        "event_unix_ns": gate_timestamp["unix_ns"],
+        "event_type": "prestim_baseline_end",
+        "notes": "reason=%s; requested_sec=%.3f; camera_elapsed_sec=%.3f; gray_elapsed_sec=%.3f; forced=%s; waited_for_minimum_gray_after_override=%s"
+        % (
+            baseline_result["end_reason"],
+            baseline_result["requested_sec"],
+            baseline_result["camera_baseline_elapsed_sec"],
+            baseline_result["gray_elapsed_sec"],
+            baseline_result["forced"],
+            baseline_result["waited_for_minimum_gray_after_override"],
+        ),
+    }
 
 
 def run_poststim_black_baseline(screen, iti_raw, event_log_path, stimulus_playback_completed=True):
@@ -1260,21 +1280,14 @@ def main():
 
                 base.append_csv_row(
                     event_log_path,
-                    {
-                        "utc_iso": prestim_gate_released_utc,
-                        "unix_time_utc_sec": prestim_gate_released_unix_sec,
-                        "event_type": "prestim_baseline_end",
-                        "display_request_unix_ns": prestim_gate_released_unix_ns,
-                        "notes": "reason=%s; requested_sec=%.3f; camera_elapsed_sec=%.3f; gray_elapsed_sec=%.3f; forced=%s; waited_for_minimum_gray_after_override=%s"
-                        % (
-                            baseline_result["end_reason"],
-                            baseline_result["requested_sec"],
-                            baseline_result["camera_baseline_elapsed_sec"],
-                            baseline_result["gray_elapsed_sec"],
-                            baseline_result["forced"],
-                            baseline_result["waited_for_minimum_gray_after_override"],
-                        ),
-                    },
+                    make_prestim_baseline_end_event_row(
+                        baseline_result,
+                        {
+                            "utc_iso": prestim_gate_released_utc,
+                            "unix_sec": prestim_gate_released_unix_sec,
+                            "unix_ns": prestim_gate_released_unix_ns,
+                        },
+                    ),
                     base.EVENT_FIELDS,
                 )
                 base.append_csv_row(
