@@ -972,14 +972,24 @@ def write_session_manifest(session_root, metadata, file_paths):
         "files": {},
     }
     for name, path in file_paths.items():
-        path = Path(path)
-        try:
-            manifest["files"][name] = str(path.relative_to(session_root))
-        except ValueError:
-            manifest["files"][name] = str(path)
+        manifest["files"][name] = session_manifest_artifact_path(session_root, path)
     manifest_path = Path(session_root) / "session_manifest.json"
     atomic_write_json(manifest_path, manifest)
     return manifest_path
+
+
+def session_manifest_artifact_path(session_root, path):
+    """Return a truthful manifest reference for an optional session artifact."""
+    if path is None:
+        return None
+    path = Path(path)
+    if not path.exists():
+        return None
+    session_root = Path(session_root)
+    try:
+        return str(path.relative_to(session_root))
+    except ValueError:
+        return str(path)
 
 
 def print_progress(trial_number, total_trials, start_time):
@@ -1138,6 +1148,10 @@ def main(argv=None):
         "n_images_to_use": n_images_to_use,
         "n_repeats": n_repeats,
         "planned_sequence_duration_sec": planned_playback_sec,
+        "planned_task_duration_sec": planned_task_duration_seconds(trials),
+        "include_final_iti": True,
+        "final_iti_played": bool(trials and trials[-1].get("iti_will_play", True)),
+        "final_iti_policy": "played_before_final_gray",
         "image_subset_seed": IMAGE_SUBSET_SEED,
         "resolved_image_subset_seed": IMAGE_SUBSET_SEED,
         "trial_order_seed": TRIAL_ORDER_SEED,

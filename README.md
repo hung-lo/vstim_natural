@@ -188,6 +188,10 @@ camera timing, exact realized ITIs, and operational statuses including
 `stimulus_complete_camera_left_running`, `interrupted`, `failed`, and
 `incomplete`.
 
+Manifest artifact entries are existence-aware: an artifact is listed by its
+relative path only after it exists, and unavailable optional camera artifacts
+are recorded as `null` rather than as fabricated paths.
+
 ## Photodiode patch
 
 The photodiode patch is built into the session raw files. The current default
@@ -207,6 +211,14 @@ planned-sequence CSV records `planned_stim_duration_sec`,
 `planned_iti_frames`, `planned_iti_duration_sec`, and `iti_will_play` for every
 trial. Session metadata records `planned_sequence_duration_sec`, and the event
 log records the same planned ITI for each `iti_on` event.
+
+The two runners intentionally retain different final-ITI policies. The plain
+`run_stringer_vstim.py` runner plays the final planned ITI before the final
+gray screen and records `final_iti_policy=played_before_final_gray`. The
+camera runner skips the final planned ITI and transitions directly to its
+controlled post-stimulus gray/black workflow, recording
+`final_iti_policy=skipped_before_poststim_gray`. These metadata fields describe
+the existing behavior; they do not change timing.
 
 Only the 19 possible ITI raw files are cached per session:
 `gray_iti_042f.raw` through `gray_iti_060f.raw`.

@@ -425,8 +425,80 @@ class Patch2WorkflowTests(unittest.TestCase):
                 )
                 payload = json.loads(manifest_path.read_text())
                 self.assertEqual(payload["files"]["metadata"], "s_metadata.json")
+                self.assertIsNone(payload["files"]["event_log"])
                 self.assertEqual(payload["status"], "complete")
                 self.assertFalse(list(root.glob("*.tmp")))
+
+    def test_manifest_artifact_paths_require_existing_files(self):
+        with __import__("tempfile").TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            session_root = root / "session"
+            session_root.mkdir()
+            existing = session_root / "existing.csv"
+            existing.write_text("data")
+            outside = root / "outside.csv"
+            outside.write_text("data")
+            metadata = {"session_id": "s", "mouse_id": "m", "session_status": "complete"}
+            manifest_path = base.write_session_manifest(
+                session_root,
+                metadata,
+                {
+                    "existing": existing,
+                    "missing": session_root / "missing.csv",
+                    "explicit_none": None,
+                    "outside": outside,
+                },
+            )
+            files = json.loads(manifest_path.read_text())["files"]
+            self.assertEqual(files["existing"], "existing.csv")
+            self.assertIsNone(files["missing"])
+            self.assertIsNone(files["explicit_none"])
+            self.assertEqual(files["outside"], str(outside))
+
+    def test_camera_manifest_artifacts_follow_filesystem_state(self):
+        states = [
+            ("stimulus_complete_camera_left_running", False, False),
+            ("incomplete", False, False),
+            ("protocol_complete_video_pending", False, True),
+            ("complete", True, True),
+        ]
+        with __import__("tempfile").TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            for index, (status, has_event_log, has_video_manifest) in enumerate(states):
+                session_root = root / ("session_%d" % index)
+                video_dir = session_root / "video"
+                video_dir.mkdir(parents=True)
+                metadata = {
+                    "session_id": "s%d" % index,
+                    "mouse_id": "m",
+                    "session_status": status,
+                }
+                metadata_path = session_root / "metadata.json"
+                metadata_path.write_text(json.dumps(metadata))
+                event_log = video_dir / "camera_control_events.csv"
+                video_manifest = video_dir / "video_manifest.json"
+                if has_event_log:
+                    event_log.write_text("event\n")
+                if has_video_manifest:
+                    video_manifest.write_text("{}\n")
+                manifest_path = base.write_session_manifest(
+                    session_root,
+                    metadata,
+                    {
+                        "metadata": metadata_path,
+                        "camera_event_log": event_log,
+                        "video_manifest": video_manifest,
+                    },
+                )
+                files = json.loads(manifest_path.read_text())["files"]
+                self.assertEqual(
+                    files["camera_event_log"],
+                    "video/camera_control_events.csv" if has_event_log else None,
+                )
+                self.assertEqual(
+                    files["video_manifest"],
+                    "video/video_manifest.json" if has_video_manifest else None,
+                )
 
     def test_manifest_status_matches_metadata_for_camera_outcomes(self):
         statuses = [

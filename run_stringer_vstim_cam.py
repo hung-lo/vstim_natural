@@ -1289,6 +1289,10 @@ def main(argv=None):
         "n_images_to_use": n_images_to_use,
         "n_repeats": n_repeats,
         "planned_sequence_duration_sec": planned_playback_sec,
+        "planned_task_duration_sec": base.planned_task_duration_seconds(trials),
+        "include_final_iti": False,
+        "final_iti_played": bool(trials and trials[-1].get("iti_will_play", False)),
+        "final_iti_policy": "skipped_before_poststim_gray",
         "image_subset_seed": base.IMAGE_SUBSET_SEED,
         "resolved_image_subset_seed": base.IMAGE_SUBSET_SEED,
         "trial_order_seed": base.TRIAL_ORDER_SEED,
@@ -1900,9 +1904,11 @@ def main(argv=None):
         metadata["prestim_gate_released_unix_sec"] = prestim_gate_released_unix_sec
         metadata["prestim_gate_released_unix_ns"] = prestim_gate_released_unix_ns
         base.atomic_write_json(metadata_path, metadata)
-        camera_video_manifest = None
-        if poststim_result:
-            camera_video_manifest = poststim_result.get("video_manifest")
+        camera_video_manifest = (
+            poststim_result.get("video_manifest") if poststim_result else None
+        )
+        if camera_video_manifest is None:
+            camera_video_manifest = session_root / "video" / "video_manifest.json"
         base.write_session_manifest(
             session_root,
             metadata,
