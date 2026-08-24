@@ -328,15 +328,20 @@ class CameraControlAndPoststimTests(unittest.TestCase):
         self.assertEqual(stop_calls, ["stop"])
         self.assertEqual(fetch_calls, ["fetch"])
         self.assertEqual(event_types, [
+            "final_gray_start",
             "poststim_gray_start",
             "poststim_gray_end",
+            "final_gray_end",
             "poststim_black_on",
+            "black_baseline_start",
             "camera_stop_requested",
             "camera_stop_confirmed",
             "camera_fetch_started",
+            "camera_fetch_returned",
             "camera_fetch_completed",
             "camera_conversion_completed",
             "poststim_black_end",
+            "black_baseline_end",
             "session_end",
         ])
         self.assertTrue(result["camera_stop_confirmed"])

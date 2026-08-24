@@ -7,9 +7,12 @@ This version uses the lab's rpg framebuffer path rather than pygame.
 """
 
 import csv
+import argparse
 import json
+import math
 import os
 import random
+import select
 import sys
 import tempfile
 import time
@@ -26,6 +29,11 @@ IMAGE_DIR_CANDIDATES = [
 ]
 OUTPUT_ROOT = Path("/mnt/hd")
 SESSION_NAME_SUFFIX = "vstim_natural"
+SESSION_OUTPUT_SCHEMA_VERSION = 2
+EVENT_LOG_SCHEMA_VERSION = 1
+PLANNED_SEQUENCE_SCHEMA_VERSION = 1
+STATUS_TTY_INTERVAL_SEC = 1.0
+STATUS_NON_TTY_INTERVAL_SEC = 30.0
 
 SCREEN_RESOLUTION = (1024, 600)
 SCREEN_BACKGROUND_GRAY = 127
@@ -133,6 +141,31 @@ def capture_timestamp():
 
 def utc_iso_now():
     return unix_ns_to_iso(time.time_ns())
+
+
+def atomic_write_json(path, payload):
+    """Write JSON atomically without adding timing-sensitive event fsyncs."""
+    path = Path(path)
+    ensure_dir(path.parent)
+    temporary_path = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=str(path.parent),
+            prefix=".%s." % path.name,
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            temporary_path = Path(handle.name)
+            json.dump(payload, handle, indent=2, sort_keys=True)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(str(temporary_path), str(path))
+    finally:
+        if temporary_path is not None and temporary_path.exists():
+            temporary_path.unlink()
 
 
 def utc_session_stamp():
@@ -348,6 +381,28 @@ def calculate_planned_sequence_duration(trials, include_final_iti=True):
     return total
 
 
+def planned_task_duration_seconds(sequence):
+    """Return the exact duration of the realized sequence, excluding skipped ITIs."""
+    return calculate_planned_sequence_duration(sequence, include_final_iti=False)
+
+
+def planned_task_remaining_seconds(sequence, next_trial_index):
+    """Return exact remaining task time before ``next_trial_index`` begins."""
+    total = 0.0
+    for index, trial in enumerate(sequence[next_trial_index:], start=next_trial_index):
+        total += float(trial["planned_stim_duration_sec"])
+        if trial.get("iti_will_play", index < len(sequence) - 1):
+            total += float(trial["planned_iti_duration_sec"])
+    return total
+
+
+def planned_task_remaining_during_iti(sequence, trial_index, current_iti_remaining_sec):
+    """Return current ITI remainder plus the exact future planned sequence."""
+    return max(0.0, float(current_iti_remaining_sec)) + planned_task_remaining_seconds(
+        sequence, trial_index + 1
+    )
+
+
 def write_csv(path, rows, fieldnames):
     ensure_dir(path.parent)
     with path.open("w", newline="") as handle:
@@ -508,6 +563,8 @@ def run_trial_sequence(
     event_log_path=None,
     gpio=None,
     include_final_iti=True,
+    status_callback=None,
+    show_legacy_progress=True,
     **legacy_kwargs
 ):
     if loaded_iti_raws is None and "iti_raw" in legacy_kwargs:
@@ -553,7 +610,10 @@ def run_trial_sequence(
             )
             append_csv_row(event_log_path, iti_row, EVENT_FIELDS)
 
-        print_progress(trial_index, total_trials, playback_start)
+        if show_legacy_progress:
+            print_progress(trial_index, total_trials, playback_start)
+        if status_callback is not None:
+            status_callback(trial_index, total_trials, trials)
 
 
 def build_stim_raw_cache(rpg_module, session_raw_dir, selected_image_files):
@@ -620,25 +680,96 @@ def prompt_text(prompt):
     try:
         return input(prompt)
     except EOFError:
-        return ""
+        raise RuntimeError("Input ended unexpectedly at EOF while answering: %s" % prompt) from None
+
+
+def prompt_required_text(prompt, sanitizer=None):
+    while True:
+        raw = prompt_text(prompt)
+        value = raw.strip()
+        checked = sanitizer(value) if sanitizer is not None else value
+        if value and checked and any(char.isalnum() for char in checked):
+            return checked
+        print("A non-empty value is required.")
+
+
+def sanitize_required_text(raw, sanitizer=None, label="Value"):
+    value = str(raw).strip()
+    checked = sanitizer(value) if sanitizer is not None else value
+    if not value or not checked or not any(char.isalnum() for char in checked):
+        raise ValueError("%s cannot be empty after sanitization" % label)
+    return checked
+
+
+def prompt_optional_text(prompt):
+    return prompt_text(prompt).strip()
+
+
+def prompt_int_with_default(prompt, default_value, minimum=None, maximum=None):
+    while True:
+        raw = prompt_text("%s [%s]: " % (prompt, default_value)).strip()
+        if not raw:
+            value = default_value
+        else:
+            try:
+                value = int(raw)
+            except (TypeError, ValueError):
+                print("Enter a whole number.")
+                continue
+        if minimum is not None and value < minimum:
+            print("Value must be at least %s." % minimum)
+            continue
+        if maximum is not None and value > maximum:
+            print("Value must be at most %s." % maximum)
+            continue
+        return value
+
+
+def prompt_float_with_default(prompt, default_value, minimum=None, maximum=None):
+    while True:
+        raw = prompt_text("%s [%s]: " % (prompt, default_value)).strip()
+        if not raw:
+            value = float(default_value)
+        else:
+            try:
+                value = float(raw)
+            except (TypeError, ValueError):
+                print("Enter a finite number.")
+                continue
+        if not math.isfinite(value):
+            print("Value must be finite.")
+            continue
+        if minimum is not None and value < minimum:
+            print("Value must be at least %s." % minimum)
+            continue
+        if maximum is not None and value > maximum:
+            print("Value must be at most %s." % maximum)
+            continue
+        return value
+
+
+def prompt_yes_no_strict(prompt, default=None):
+    suffix = " [Y/n]" if default is True else " [y/N]" if default is False else ""
+    while True:
+        raw = prompt_text("%s%s: " % (prompt, suffix)).strip().lower()
+        if not raw:
+            if default is not None:
+                return bool(default)
+            print("Enter y/yes or n/no.")
+            continue
+        if raw in {"y", "yes"}:
+            return True
+        if raw in {"n", "no"}:
+            return False
+        print("Enter y/yes or n/no.")
 
 
 def prompt_int_or_default(prompt, default_value, minimum=1):
-    raw = prompt_text("%s [%d]: " % (prompt, default_value)).strip()
-    if not raw:
-        return default_value
-    value = int(raw)
-    if value < minimum:
-        raise ValueError("%s must be at least %d" % (prompt, minimum))
-    return value
+    return prompt_int_with_default(prompt, default_value, minimum=minimum)
 
 
 def prompt_yes_no(prompt, default_yes=True):
-    suffix = "[Y/n]" if default_yes else "[y/N]"
-    raw = prompt_text("%s %s: " % (prompt, suffix)).strip().lower()
-    if not raw:
-        return default_yes
-    return raw in {"y", "yes"}
+    return prompt_yes_no_strict(prompt, default=default_yes)
 
 
 def format_seconds(seconds):
@@ -656,6 +787,201 @@ def format_duration(seconds):
     return "%02d:%02d:%02d.%d" % (hours, minutes, whole_seconds, tenths)
 
 
+class StatusReporter:
+    """Throttled operator status output using monotonic operational timing."""
+
+    def __init__(self, camera_enabled=False, stream=None):
+        self.camera_enabled = bool(camera_enabled)
+        self.stream = stream or sys.stdout
+        self.is_tty = bool(getattr(self.stream, "isatty", lambda: False)())
+        self.interval_sec = STATUS_TTY_INTERVAL_SEC if self.is_tty else STATUS_NON_TTY_INTERVAL_SEC
+        self.last_emit_monotonic = None
+        self.last_phase = None
+        self.camera_recording_request_monotonic_ns = None
+        self.camera_recording_confirmed_monotonic_ns = None
+        self.camera_stop_confirmed_monotonic_ns = None
+        self.camera_recording_elapsed_local_sec = 0.0
+        self.camera_stopped = not self.camera_enabled
+
+    def camera_request(self, monotonic_ns=None):
+        self.camera_recording_request_monotonic_ns = monotonic_ns or time.monotonic_ns()
+
+    def camera_confirmed(self, monotonic_ns=None):
+        self.camera_recording_confirmed_monotonic_ns = monotonic_ns or time.monotonic_ns()
+        self.camera_stopped = False
+
+    def camera_stop_confirmed(self, monotonic_ns=None):
+        self.camera_stop_confirmed_monotonic_ns = monotonic_ns or time.monotonic_ns()
+        anchor = self.camera_recording_confirmed_monotonic_ns or self.camera_recording_request_monotonic_ns
+        if anchor is not None:
+            self.camera_recording_elapsed_local_sec = max(
+                0.0, (self.camera_stop_confirmed_monotonic_ns - anchor) / 1_000_000_000.0
+            )
+        self.camera_stopped = True
+
+    def camera_elapsed_seconds(self, now_ns=None):
+        if self.camera_stopped:
+            return self.camera_recording_elapsed_local_sec
+        anchor = self.camera_recording_confirmed_monotonic_ns or self.camera_recording_request_monotonic_ns
+        if anchor is None:
+            return 0.0
+        return max(0.0, ((now_ns or time.monotonic_ns()) - anchor) / 1_000_000_000.0)
+
+    def _should_emit(self, phase, force=False, now=None):
+        now = time.monotonic() if now is None else now
+        phase_changed = phase != self.last_phase
+        if force or phase_changed or self.last_emit_monotonic is None:
+            return True
+        return now - self.last_emit_monotonic >= self.interval_sec
+
+    def emit(self, line, phase, force=False, now=None):
+        now = time.monotonic() if now is None else now
+        if not self._should_emit(phase, force=force, now=now):
+            return False
+        self.last_emit_monotonic = now
+        self.last_phase = phase
+        if self.is_tty:
+            self.stream.write("\r" + line + " " * 8)
+        else:
+            self.stream.write(line + "\n")
+        self.stream.flush()
+        return True
+
+    def _rec_prefix(self):
+        if not self.camera_enabled:
+            return "CAM OFF"
+        if self.camera_stopped:
+            return "REC stopped %s" % format_seconds(self.camera_elapsed_seconds())
+        return "REC %s" % format_seconds(self.camera_elapsed_seconds())
+
+    def task(self, trial_number, total_trials, sequence, force=False):
+        remaining = planned_task_remaining_seconds(sequence, trial_number)
+        percent = 100.0 if not total_trials else trial_number / float(total_trials) * 100.0
+        finish = datetime.now().astimezone().timestamp() + remaining
+        finish_clock = datetime.fromtimestamp(finish).strftime("%H:%M:%S")
+        line = "%s | TASK %d/%d (%.1f%%) | task remaining %s | finish ~%s" % (
+            self._rec_prefix(), trial_number, total_trials, percent, format_seconds(remaining), finish_clock
+        )
+        return self.emit(line, "TASK", force=force)
+
+    def black_baseline(self, elapsed_sec, force=False, suffix="press Enter to stop camera"):
+        line = "%s | BLACK BASELINE %s elapsed | %s" % (
+            self._rec_prefix(), format_seconds(elapsed_sec), suffix
+        )
+        return self.emit(line, "BLACK BASELINE", force=force)
+
+    def phase(self, phase, detail="", force=True):
+        return self.emit("%s | %s" % (self._rec_prefix(), detail or phase), phase, force=force)
+
+
+def build_session_parser(camera_flags=False):
+    parser = argparse.ArgumentParser(description="Run the Stringer natural-image visual stimulus.")
+    parser.add_argument("--mouse-id", default=None)
+    parser.add_argument("--session-notes", default=None)
+    parser.add_argument("--num-images", type=int, default=None)
+    parser.add_argument("--repeats", type=int, default=None)
+    parser.add_argument("--num-trials", type=int, default=None)
+    parser.add_argument("--stimulus-duration-sec", type=float, default=None)
+    parser.add_argument("--iti-min-sec", type=float, default=None)
+    parser.add_argument("--iti-max-sec", type=float, default=None)
+    parser.add_argument("--initial-gray-sec", type=float, default=None)
+    parser.add_argument("--final-gray-sec", type=float, default=None)
+    if camera_flags:
+        camera_group = parser.add_mutually_exclusive_group()
+        camera_group.add_argument("--camera", action="store_true", dest="camera")
+        camera_group.add_argument("--no-camera", action="store_false", dest="camera")
+        parser.set_defaults(camera=None)
+    else:
+        parser.add_argument("--camera", action="store_true", default=False, help=argparse.SUPPRESS)
+        parser.add_argument("--no-camera", action="store_true", default=False, help=argparse.SUPPRESS)
+    return parser
+
+
+def validate_cli_or_prompt_number(value, name, minimum=None, maximum=None, integer=False):
+    if integer:
+        if isinstance(value, bool) or int(value) != value:
+            raise ValueError("%s must be a whole number" % name)
+        value = int(value)
+    else:
+        value = float(value)
+        if not math.isfinite(value):
+            raise ValueError("%s must be finite" % name)
+    if minimum is not None and value < minimum:
+        raise ValueError("%s must be at least %s" % (name, minimum))
+    if maximum is not None and value > maximum:
+        raise ValueError("%s must be at most %s" % (name, maximum))
+    return value
+
+
+def apply_session_overrides(args):
+    global STIM_DURATION_SEC, ITI_MIN_SEC, ITI_MAX_SEC, ITI_DURATION_SEC
+    global INITIAL_GRAY_SEC, FINAL_GRAY_SEC, POSTSTIM_GRAY_PLANNED_SEC, POSTSTIM_TRANSITION_GRAY_SEC
+    if args.stimulus_duration_sec is not None:
+        STIM_DURATION_SEC = validate_cli_or_prompt_number(args.stimulus_duration_sec, "stimulus duration", 0.001)
+    if args.iti_min_sec is not None:
+        ITI_MIN_SEC = validate_cli_or_prompt_number(args.iti_min_sec, "ITI minimum", 0.0)
+    if args.iti_max_sec is not None:
+        ITI_MAX_SEC = validate_cli_or_prompt_number(args.iti_max_sec, "ITI maximum", 0.0)
+    if ITI_MAX_SEC < ITI_MIN_SEC:
+        raise ValueError("ITI maximum must be at least the ITI minimum")
+    if args.initial_gray_sec is not None:
+        INITIAL_GRAY_SEC = validate_cli_or_prompt_number(args.initial_gray_sec, "initial gray duration", 0.0)
+    if args.final_gray_sec is not None:
+        FINAL_GRAY_SEC = validate_cli_or_prompt_number(args.final_gray_sec, "final gray duration", 0.0)
+    ITI_DURATION_SEC = (ITI_MIN_SEC + ITI_MAX_SEC) / 2.0
+    POSTSTIM_GRAY_PLANNED_SEC = FINAL_GRAY_SEC
+    POSTSTIM_TRANSITION_GRAY_SEC = POSTSTIM_GRAY_PLANNED_SEC
+
+
+def derive_session_status(
+    stimulus_playback_completed,
+    camera_enabled=False,
+    camera_stop_confirmed=False,
+    camera_data_secured=False,
+    camera_left_running_by_user=False,
+    camera_cleanup_error="",
+    interrupted=False,
+    primary_failure=False,
+    noncamera_cleanup_error="",
+):
+    if interrupted:
+        return "interrupted"
+    if primary_failure:
+        return "failed"
+    if noncamera_cleanup_error:
+        return "cleanup_failed"
+    if not stimulus_playback_completed:
+        return "incomplete"
+    if camera_enabled and camera_left_running_by_user:
+        return "stimulus_complete_camera_left_running"
+    if camera_enabled and camera_cleanup_error:
+        return "protocol_complete_camera_cleanup_failed"
+    if camera_enabled and (not camera_stop_confirmed or not camera_data_secured):
+        return "protocol_complete_video_pending"
+    return "complete"
+
+
+def write_session_manifest(session_root, metadata, file_paths):
+    manifest = {
+        "session_id": metadata.get("session_id"),
+        "mouse_id": metadata.get("mouse_id"),
+        "protocol": "stringer_natural_image_visual_stimulus",
+        "session_output_schema_version": SESSION_OUTPUT_SCHEMA_VERSION,
+        "status": metadata.get("session_status", "incomplete"),
+        "camera_data_secured": bool(metadata.get("camera_data_secured", False)),
+        "files": {},
+    }
+    for name, path in file_paths.items():
+        path = Path(path)
+        try:
+            manifest["files"][name] = str(path.relative_to(session_root))
+        except ValueError:
+            manifest["files"][name] = str(path)
+    manifest_path = Path(session_root) / "session_manifest.json"
+    atomic_write_json(manifest_path, manifest)
+    return manifest_path
+
+
 def print_progress(trial_number, total_trials, start_time):
     elapsed = time.perf_counter() - start_time
     per_trial = STIM_DURATION_SEC + (ITI_MIN_SEC + ITI_MAX_SEC) / 2.0
@@ -668,7 +994,11 @@ def print_progress(trial_number, total_trials, start_time):
     return elapsed
 
 
-def main():
+def main(argv=None):
+    args = build_session_parser(camera_flags=False).parse_args(argv)
+    if args.camera:
+        raise RuntimeError("Camera recording is provided by run_stringer_vstim_cam.py; use --no-camera here.")
+    apply_session_overrides(args)
     print_environment()
     try:
         import rpg
@@ -677,11 +1007,25 @@ def main():
             "The rpg package is not installed. Install the SjulsonLab rpg repo on the behavior Pi first."
         ) from exc
 
-    mouse_id_raw = prompt_text("Mouse ID: ")
-    mouse_id = sanitize_text(mouse_id_raw) or "mouse"
-    session_notes = prompt_text("Session notes, optional: ").strip()
-    n_images_to_use = prompt_int_or_default("Number of unique images to use", N_IMAGES_TO_USE)
-    n_repeats = prompt_int_or_default("Repeats per image", N_REPEATS)
+    mouse_id = sanitize_required_text(args.mouse_id, sanitize_text, "Mouse ID") if args.mouse_id is not None else prompt_required_text("Mouse ID: ", sanitize_text)
+    mouse_id_raw = args.mouse_id if args.mouse_id is not None else mouse_id
+    session_notes = args.session_notes if args.session_notes is not None else prompt_optional_text("Session notes, optional: ")
+    n_images_to_use = args.num_images if args.num_images is not None else prompt_int_with_default(
+        "Number of unique images to use", N_IMAGES_TO_USE, minimum=1
+    )
+    if n_images_to_use < 1:
+        raise ValueError("Number of unique images must be at least 1")
+    if args.num_trials is not None:
+        num_trials = validate_cli_or_prompt_number(args.num_trials, "number of trials", 1, integer=True)
+        if num_trials % n_images_to_use:
+            raise ValueError("--num-trials must be divisible by --num-images")
+        n_repeats = num_trials // n_images_to_use
+    else:
+        n_repeats = args.repeats if args.repeats is not None else prompt_int_with_default(
+            "Repeats per image", N_REPEATS, minimum=1
+        )
+        if n_repeats < 1:
+            raise ValueError("Repeats per image must be at least 1")
 
     image_dir = resolve_image_dir()
     all_pngs = list_png_files(image_dir)
@@ -700,11 +1044,15 @@ def main():
     print("  Total trials: %d" % len(trials))
     print("  Stimulus duration: %.3f s" % STIM_DURATION_SEC)
     print("  ITI range: %.3f-%.3f s (%d-%d frames)" % (ITI_MIN_SEC, ITI_MAX_SEC, iti_frame_bounds()[0], iti_frame_bounds()[1]))
-    print("  Planned stimulus sequence duration: %s" % format_duration(planned_playback_sec))
+    print("  Planned task duration: %s" % format_duration(planned_task_duration_seconds(trials)))
+    print("  Planned stimulus protocol: %s" % format_duration(planned_playback_sec + INITIAL_GRAY_SEC + FINAL_GRAY_SEC))
+    print("  Post-stimulus black baseline: not used by this runner")
+    print("  Camera transfer/conversion: not included")
+    print("  Face camera: disabled")
     print("  Output folder root: %s" % OUTPUT_ROOT)
     print("  Session folder name: %s" % make_session_name(mouse_id, "YYYYMMDDThhmmssZ"))
 
-    if not prompt_yes_no("Start this session", default_yes=True):
+    if not prompt_yes_no_strict("Create files and prepare this session", default=True):
         print("Session aborted before starting. No files were changed.")
         return 0
 
@@ -769,6 +1117,14 @@ def main():
 
     metadata = {
         "session_id": session_id,
+        "session_output_schema_version": SESSION_OUTPUT_SCHEMA_VERSION,
+        "event_log_schema_version": EVENT_LOG_SCHEMA_VERSION,
+        "planned_sequence_schema_version": PLANNED_SEQUENCE_SCHEMA_VERSION,
+        "protocol": "stringer_natural_image_visual_stimulus",
+        "session_status": "incomplete",
+        "session_completed": False,
+        "camera_enabled": False,
+        "camera_data_secured": False,
         "utc_iso_start": utc_iso_now(),
         "mouse_id_input": mouse_id_raw,
         "mouse_id": mouse_id,
@@ -808,7 +1164,17 @@ def main():
         "selected_images": selected_rows,
         "trials": trials,
     }
-    metadata_path.write_text(json.dumps(metadata, indent=2, sort_keys=True) + chr(10))
+    atomic_write_json(metadata_path, metadata)
+    write_session_manifest(
+        session_root,
+        metadata,
+        {
+            "metadata": metadata_path,
+            "planned_sequence": planned_sequence_path,
+            "event_log": event_log_path,
+            "stimulus_manifest": selected_images_path,
+        },
+    )
 
     print("Preparing session raw files...")
     stim_raw_paths, iti_raw_paths = build_session_raw_cache(rpg, raw_cache_root, selected_pngs)
@@ -818,13 +1184,38 @@ def main():
 
     gpio = None
     session_completed = False
+    session_status = "incomplete"
+    interrupted = False
+    primary_failure = False
+    phase_timing = {
+        "initial_gray_start_monotonic_ns": None,
+        "initial_gray_end_monotonic_ns": None,
+        "task_start_monotonic_ns": None,
+        "task_end_monotonic_ns": None,
+        "final_gray_start_monotonic_ns": None,
+        "final_gray_end_monotonic_ns": None,
+    }
+    status_reporter = StatusReporter(camera_enabled=False)
     if USE_GPIO:
         gpio = setup_gpio()
 
     try:
         with rpg.Screen(SCREEN_RESOLUTION, background=SCREEN_BACKGROUND_GRAY, colormode=SCREEN_COLORMODE) as screen:
+            phase_timing["initial_gray_start_monotonic_ns"] = time.monotonic_ns()
+            status_reporter.phase("INITIAL GRAY", "initial gray")
+            append_csv_row(
+                event_log_path,
+                {"event_type": "initial_gray_start", "notes": "camera_enabled=false"},
+                EVENT_FIELDS,
+            )
             screen.display_greyscale(SCREEN_BACKGROUND_GRAY)
             time.sleep(INITIAL_GRAY_SEC)
+            phase_timing["initial_gray_end_monotonic_ns"] = time.monotonic_ns()
+            append_csv_row(
+                event_log_path,
+                {"event_type": "initial_gray_end", "notes": "camera_enabled=false"},
+                EVENT_FIELDS,
+            )
 
             for image_path in selected_pngs:
                 loaded_stim_raws[image_path.stem] = screen.load_raw(str(stim_raw_paths[image_path.stem]))
@@ -845,6 +1236,13 @@ def main():
             print("Stimulus playback is now active.")
             sys.stdout.flush()
 
+            phase_timing["task_start_monotonic_ns"] = time.monotonic_ns()
+            status_reporter.phase("TASK", "TASK starting")
+            append_csv_row(
+                event_log_path,
+                {"event_type": "task_start", "notes": "camera_enabled=false"},
+                EVENT_FIELDS,
+            )
             run_trial_sequence(
                 screen,
                 trials,
@@ -854,10 +1252,33 @@ def main():
                 iti_raw_paths,
                 event_log_path,
                 gpio=gpio if USE_GPIO else None,
+                status_callback=lambda trial_number, total, sequence: status_reporter.task(
+                    trial_number, total, sequence
+                ),
+                show_legacy_progress=False,
+            )
+            phase_timing["task_end_monotonic_ns"] = time.monotonic_ns()
+            append_csv_row(
+                event_log_path,
+                {"event_type": "task_end", "notes": "last_trial_completed=true"},
+                EVENT_FIELDS,
             )
 
+            phase_timing["final_gray_start_monotonic_ns"] = time.monotonic_ns()
+            status_reporter.phase("FINAL GRAY", "final controlled gray")
+            append_csv_row(
+                event_log_path,
+                {"event_type": "final_gray_start", "notes": "camera_enabled=false"},
+                EVENT_FIELDS,
+            )
             screen.display_greyscale(SCREEN_BACKGROUND_GRAY)
             time.sleep(FINAL_GRAY_SEC)
+            phase_timing["final_gray_end_monotonic_ns"] = time.monotonic_ns()
+            append_csv_row(
+                event_log_path,
+                {"event_type": "final_gray_end", "notes": "camera_enabled=false"},
+                EVENT_FIELDS,
+            )
             sys.stdout.write("\n")
             sys.stdout.flush()
             append_csv_row(
@@ -870,8 +1291,10 @@ def main():
                 EVENT_FIELDS,
             )
             session_completed = True
+            session_status = "complete"
 
     except KeyboardInterrupt:
+        interrupted = True
         append_csv_row(
             event_log_path,
             {
@@ -881,6 +1304,9 @@ def main():
             },
             EVENT_FIELDS,
         )
+        raise
+    except Exception:
+        primary_failure = True
         raise
     finally:
         if gpio is not None:
@@ -895,7 +1321,26 @@ def main():
         metadata["selected_images_csv"] = str(selected_images_path)
         metadata["planned_sequence_csv"] = str(planned_sequence_path)
         metadata["raw_cache_root"] = str(raw_cache_root)
-        metadata_path.write_text(json.dumps(metadata, indent=2, sort_keys=True) + chr(10))
+        metadata["session_completed"] = session_completed
+        metadata["session_status"] = derive_session_status(
+            stimulus_playback_completed=session_completed,
+            camera_enabled=False,
+            interrupted=interrupted,
+            primary_failure=primary_failure,
+        )
+        metadata.update(phase_timing)
+        metadata["camera_recording_elapsed_local_sec"] = 0.0
+        atomic_write_json(metadata_path, metadata)
+        write_session_manifest(
+            session_root,
+            metadata,
+            {
+                "metadata": metadata_path,
+                "planned_sequence": planned_sequence_path,
+                "event_log": event_log_path,
+                "stimulus_manifest": selected_images_path,
+            },
+        )
         if session_completed:
             print("Session finished. Files are in: %s" % session_root)
         else:
@@ -908,6 +1353,9 @@ def main():
 if __name__ == "__main__":
     try:
         raise SystemExit(main())
+    except KeyboardInterrupt:
+        print("Interrupted.", file=sys.stderr)
+        raise SystemExit(130)
     except Exception as exc:
         print("ERROR: %s" % exc, file=sys.stderr)
         raise

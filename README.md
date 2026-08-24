@@ -101,6 +101,21 @@ If you want camera recording plus automatic file transfer and conversion, use:
 python3 run_stringer_vstim_cam.py
 ```
 
+Both runners also accept non-interactive overrides, for example:
+
+```bash
+python3 run_stringer_vstim.py \
+  --mouse-id mouse_01 --num-images 5 --repeats 2 \
+  --stimulus-duration-sec 0.5 --iti-min-sec 0.7 --iti-max-sec 1.0
+```
+
+The camera runner requires an explicit camera choice when started. Use
+`--camera` to require recording or `--no-camera` to disable it; without either
+flag it asks before any session files or camera processes are touched. The
+camera status line reports a separate recording timer, task progress, exact
+realized task ETA, and a finish estimate. The recording timer begins only
+after camera readiness is confirmed and freezes when stop is confirmed.
+
 That wrapper now asks for a pre-stimulus camera baseline in minutes, then lets
 you type `y` and press Enter to start early after the camera process is alive
 and its session-specific `.h264` file is confirmed to be growing. The baseline
@@ -109,6 +124,13 @@ finishes, it leaves the screen black until camera stop is verified by both the
 tracked PID and the session-specific acquisition-process check. The PID file is
 removed only after that verification, and the screen remains black during file
 transfer or while a failed transfer is being resolved.
+
+During the open-ended black post-stimulus baseline, type `y` and press Enter to
+stop the camera and begin verification/fetch. The screen remains black while
+camera stop, transfer, raw-file verification, MP4 conversion, and remote raw
+cleanup are completed. Type `l` and press Enter only when you explicitly need
+to leave the camera running; the session is then marked
+`stimulus_complete_camera_left_running`.
 
 Keep `run_stringer_vstim.py` around as the plain no-camera runner and as the
 baseline path if you want to debug the display flow independently.
@@ -148,6 +170,15 @@ preview is stopped, but EOF is not interpreted as typing `y`.
 confirmed. It does not by itself mean that camera data are fully archived.
 Use `camera_data_secured`, which additionally requires raw SHA-256 verification,
 MP4 validation, and confirmed remote raw cleanup.
+
+Every session has an atomic `session_manifest.json` with relative paths to the
+session metadata, event logs, planned sequence, selected-image manifest, and
+camera manifests. The metadata records schema versions, monotonic phase and
+camera timing, exact realized ITIs, and operational statuses including
+`complete`, `protocol_complete_video_pending`,
+`protocol_complete_camera_cleanup_failed`,
+`stimulus_complete_camera_left_running`, `interrupted`, `failed`, and
+`incomplete`.
 
 ## Photodiode patch
 

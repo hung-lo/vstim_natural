@@ -1,0 +1,185 @@
+import io
+import json
+import math
+import sys
+import types
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+pil = types.ModuleType("PIL")
+image = types.ModuleType("PIL.Image")
+imagedraw = types.ModuleType("PIL.ImageDraw")
+imageops = types.ModuleType("PIL.ImageOps")
+pil.Image = image
+pil.ImageDraw = imagedraw
+pil.ImageOps = imageops
+sys.modules.setdefault("PIL", pil)
+sys.modules.setdefault("PIL.Image", image)
+sys.modules.setdefault("PIL.ImageDraw", imagedraw)
+sys.modules.setdefault("PIL.ImageOps", imageops)
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+import run_stringer_vstim as base
+import run_stringer_vstim_cam as cam
+
+
+class TtyBuffer(io.StringIO):
+    def __init__(self, is_tty):
+        super().__init__()
+        self._is_tty = is_tty
+
+    def isatty(self):
+        return self._is_tty
+
+
+class Patch2WorkflowTests(unittest.TestCase):
+    def test_required_mouse_id_reprompts_and_rejects_sanitized_empty(self):
+        with patch.object(base, "prompt_text", side_effect=["   ", "!!!", "Mouse 7"]):
+            self.assertEqual(base.prompt_required_text("Mouse: ", base.sanitize_text), "Mouse_7")
+
+    def test_strict_numeric_prompts_reject_invalid_values(self):
+        with patch.object(base, "prompt_text", side_effect=["2.9", "abc", "-1", "3"]):
+            self.assertEqual(base.prompt_int_with_default("Trials", 2, minimum=1), 3)
+        with patch.object(base, "prompt_text", side_effect=["nan", "inf", "-inf", "0.75"]):
+            self.assertAlmostEqual(base.prompt_float_with_default("ITI", 1.0, minimum=0.0), 0.75)
+
+    def test_strict_yes_no_reprompts_and_honors_only_explicit_default_blank(self):
+        with patch.object(base, "prompt_text", side_effect=["maybe", "YES"]):
+            self.assertTrue(base.prompt_yes_no_strict("Continue"))
+        with patch.object(base, "prompt_text", return_value=""):
+            self.assertTrue(base.prompt_yes_no_strict("Continue", default=True))
+        with patch.object(base, "prompt_text", side_effect=["", "no"]):
+            self.assertFalse(base.prompt_yes_no_strict("Continue"))
+
+    def test_strict_prompts_raise_on_eof(self):
+        with patch.object(base, "prompt_text", side_effect=RuntimeError("EOF")):
+            with self.assertRaises(RuntimeError):
+                base.prompt_required_text("Mouse: ")
+
+    def test_camera_selection_modes(self):
+        self.assertTrue(cam.resolve_camera_selection(True, True))
+        self.assertFalse(cam.resolve_camera_selection(False, True))
+        with self.assertRaises(RuntimeError):
+            cam.resolve_camera_selection(True, False)
+        with patch.object(base, "prompt_yes_no_strict", return_value=False) as prompt_mock:
+            self.assertFalse(cam.resolve_camera_selection(None, True))
+        prompt_mock.assert_called_once()
+        with patch.object(base, "prompt_yes_no_strict") as prompt_mock:
+            self.assertFalse(cam.resolve_camera_selection(None, False))
+        prompt_mock.assert_not_called()
+
+    def test_exact_planned_eta_uses_realized_itis(self):
+        sequence = [
+            {"planned_stim_duration_sec": 0.5, "planned_iti_duration_sec": 0.7, "iti_will_play": True},
+            {"planned_stim_duration_sec": 0.5, "planned_iti_duration_sec": 1.0, "iti_will_play": True},
+            {"planned_stim_duration_sec": 0.5, "planned_iti_duration_sec": 0.9, "iti_will_play": False},
+        ]
+        self.assertAlmostEqual(base.planned_task_duration_seconds(sequence), 3.2)
+        self.assertAlmostEqual(base.planned_task_remaining_seconds(sequence, 0), 3.2)
+        self.assertAlmostEqual(base.planned_task_remaining_seconds(sequence, 1), 2.0)
+        self.assertAlmostEqual(base.planned_task_remaining_during_iti(sequence, 0, 0.2), 2.2)
+        self.assertEqual(base.planned_task_remaining_seconds(sequence, 3), 0.0)
+
+    def test_status_reporter_throttles_tty_and_phase_transitions(self):
+        stream = TtyBuffer(True)
+        reporter = base.StatusReporter(camera_enabled=False, stream=stream)
+        reporter.emit("first", "TASK", now=10.0)
+        reporter.emit("suppressed", "TASK", now=10.5)
+        reporter.emit("phase", "BLACK BASELINE", now=10.5)
+        reporter.emit("second", "BLACK BASELINE", now=11.6)
+        output = stream.getvalue()
+        self.assertIn("first", output)
+        self.assertNotIn("suppressed", output)
+        self.assertIn("phase", output)
+        self.assertIn("second", output)
+        self.assertIn("\r", output)
+
+    def test_status_reporter_non_tty_uses_long_heartbeat(self):
+        stream = TtyBuffer(False)
+        reporter = base.StatusReporter(camera_enabled=False, stream=stream)
+        reporter.emit("first", "TASK", now=10.0)
+        reporter.emit("suppressed", "TASK", now=20.0)
+        reporter.emit("second", "TASK", now=40.1)
+        self.assertEqual(stream.getvalue().splitlines(), ["first", "second"])
+
+    def test_status_reporter_formats_camera_and_black_baseline_states(self):
+        stream = TtyBuffer(False)
+        reporter = base.StatusReporter(camera_enabled=True, stream=stream)
+        reporter.camera_confirmed(100_000_000_000)
+        reporter.task(1, 2, [
+            {"planned_stim_duration_sec": 1.0, "planned_iti_duration_sec": 0.5, "iti_will_play": True},
+            {"planned_stim_duration_sec": 1.0, "planned_iti_duration_sec": 0.5, "iti_will_play": False},
+        ], force=True)
+        reporter.black_baseline(12.0, force=True)
+        reporter.camera_stop_confirmed(160_000_000_000)
+        reporter.phase("CAMERA STOPPED", "REC stopped 00:00:00 | camera stop confirmed")
+        output = stream.getvalue()
+        self.assertIn("REC", output)
+        self.assertIn("TASK 1/2", output)
+        self.assertIn("BLACK BASELINE", output)
+        self.assertIn("camera stop confirmed", output)
+
+    def test_camera_elapsed_freezes_at_stop(self):
+        reporter = base.StatusReporter(camera_enabled=True, stream=TtyBuffer(False))
+        reporter.camera_confirmed(100_000_000_000)
+        self.assertAlmostEqual(reporter.camera_elapsed_seconds(120_000_000_000), 20.0)
+        reporter.camera_stop_confirmed(160_000_000_000)
+        self.assertAlmostEqual(reporter.camera_elapsed_seconds(220_000_000_000), 60.0)
+
+    def test_session_status_table(self):
+        self.assertEqual(base.derive_session_status(True), "complete")
+        self.assertEqual(
+            base.derive_session_status(True, True, True, False), "protocol_complete_video_pending"
+        )
+        self.assertEqual(
+            base.derive_session_status(True, True, False, False, True),
+            "stimulus_complete_camera_left_running",
+        )
+        self.assertEqual(base.derive_session_status(False, primary_failure=True), "failed")
+        self.assertEqual(
+            base.derive_session_status(True, camera_enabled=True, camera_cleanup_error="oops", primary_failure=True),
+            "failed",
+        )
+        self.assertEqual(base.derive_session_status(False, interrupted=True), "interrupted")
+        self.assertEqual(base.derive_session_status(True, noncamera_cleanup_error="oops"), "cleanup_failed")
+
+    def test_black_baseline_operator_commands(self):
+        class FakeStdin:
+            def __init__(self, value):
+                self.value = value
+
+            def readline(self):
+                return self.value
+
+        for value, expected in [("\n", "stop"), ("s\n", "stop"), ("l\n", "leave")]:
+            with patch.object(cam.sys, "stdin", FakeStdin(value)), patch.object(
+                cam.select, "select", return_value=([cam.sys.stdin], [], [])
+            ):
+                self.assertEqual(cam.black_baseline_operator_command(0.0), expected)
+
+        with patch.object(cam.sys, "stdin", FakeStdin("")), patch.object(
+            cam.select, "select", return_value=([cam.sys.stdin], [], [])
+        ):
+            with self.assertRaises(RuntimeError):
+                cam.black_baseline_operator_command(0.0)
+
+    def test_session_manifest_is_atomic_and_uses_relative_paths(self):
+        with self.subTest("manifest"):
+            with __import__("tempfile").TemporaryDirectory() as tmpdir:
+                root = Path(tmpdir)
+                metadata = {"session_id": "s", "mouse_id": "m", "session_status": "complete"}
+                metadata_path = root / "s_metadata.json"
+                metadata_path.write_text(json.dumps(metadata))
+                manifest_path = base.write_session_manifest(
+                    root, metadata, {"metadata": metadata_path, "event_log": root / "s_event_log.csv"}
+                )
+                payload = json.loads(manifest_path.read_text())
+                self.assertEqual(payload["files"]["metadata"], "s_metadata.json")
+                self.assertEqual(payload["status"], "complete")
+                self.assertFalse(list(root.glob("*.tmp")))
+
+
+if __name__ == "__main__":
+    unittest.main()
