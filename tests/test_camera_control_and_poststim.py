@@ -1013,6 +1013,119 @@ class CameraControlAndPoststimTests(unittest.TestCase):
         self.assertEqual(len(commands), 2)
         self.assertIn("camera_preview.pid", commands[-1])
 
+    def _dispatch_recovery_command(self, command):
+        parser = rc.build_parser()
+        args = parser.parse_args(
+            [command, "--mouse-id", "fallback-mouse", "--session-id", "fallback-session"]
+        )
+        return args.func(args)
+
+    def _assert_invalid_state_rejected_at_command_entry(self, state, expected_exception):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            state_path = root / ".vstim_natural_camera_session.json"
+            state_path.write_text(json.dumps(state))
+            with patch.object(rc, "STATE_FILE", state_path), patch.object(
+                rc, "GENERIC_STATE_FILE", root / ".last_remote_camera_session.json"
+            ), patch.object(rc, "LEGACY_STATE_FILE", root / "legacy.json"), patch.object(
+                rc, "build_state_from_args"
+            ) as build_state_mock, patch.object(rc, "run_ssh") as ssh_mock, patch.object(
+                rc, "run_rsync"
+            ) as rsync_mock, patch.object(rc, "run_camera_conversion_workflow") as conversion_mock, patch.object(
+                rc, "delete_remote_camera_raw_files"
+            ) as delete_mock:
+                for command in ("fetch", "convert", "stop-fetch"):
+                    with self.assertRaises(expected_exception):
+                        self._dispatch_recovery_command(command)
+
+                build_state_mock.assert_not_called()
+                ssh_mock.assert_not_called()
+                rsync_mock.assert_not_called()
+                conversion_mock.assert_not_called()
+                delete_mock.assert_not_called()
+
+    def test_command_entries_reject_foreign_repository_state(self):
+        self._assert_invalid_state_rejected_at_command_entry(
+            valid_camera_state(controller_repository="vstim_natural_img_reward"),
+            rc.CameraStateOwnershipError,
+        )
+
+    def test_command_entries_reject_corrupt_state_without_cli_fallback(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            state_path = root / ".vstim_natural_camera_session.json"
+            state_path.write_text("{not valid json")
+            with patch.object(rc, "STATE_FILE", state_path), patch.object(
+                rc, "GENERIC_STATE_FILE", root / ".last_remote_camera_session.json"
+            ), patch.object(rc, "LEGACY_STATE_FILE", root / "legacy.json"), patch.object(
+                rc, "build_state_from_args"
+            ) as build_state_mock, patch.object(rc, "run_ssh") as ssh_mock, patch.object(
+                rc, "run_rsync"
+            ) as rsync_mock, patch.object(rc, "run_camera_conversion_workflow") as conversion_mock, patch.object(
+                rc, "delete_remote_camera_raw_files"
+            ) as delete_mock:
+                for command in ("fetch", "convert", "stop-fetch"):
+                    with self.assertRaises(rc.CameraStateCorruptError):
+                        self._dispatch_recovery_command(command)
+
+                build_state_mock.assert_not_called()
+                ssh_mock.assert_not_called()
+                rsync_mock.assert_not_called()
+                conversion_mock.assert_not_called()
+                delete_mock.assert_not_called()
+
+    def test_command_entries_reject_schema_mismatch_without_cli_fallback(self):
+        self._assert_invalid_state_rejected_at_command_entry(
+            valid_camera_state(state_schema_version=999),
+            rc.CameraStateSchemaError,
+        )
+
+    def test_fetch_and_stop_fetch_reject_ambiguous_legacy_state(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            generic_path = root / ".last_remote_camera_session.json"
+            generic_path.write_text(json.dumps({"session_id": "old"}))
+            with patch.object(rc, "STATE_FILE", root / ".vstim_natural_camera_session.json"), patch.object(
+                rc, "GENERIC_STATE_FILE", generic_path
+            ), patch.object(rc, "LEGACY_STATE_FILE", root / "legacy.json"), patch.object(
+                rc, "build_state_from_args"
+            ) as build_state_mock, patch.object(rc, "run_ssh") as ssh_mock, patch.object(
+                rc, "run_rsync"
+            ) as rsync_mock, patch.object(rc, "delete_remote_camera_raw_files") as delete_mock:
+                for command in ("fetch", "stop-fetch"):
+                    with self.assertRaises(rc.CameraStateOwnershipError):
+                        self._dispatch_recovery_command(command)
+
+                build_state_mock.assert_not_called()
+                ssh_mock.assert_not_called()
+                rsync_mock.assert_not_called()
+                delete_mock.assert_not_called()
+
+    def test_state_not_found_allows_explicit_fetch_recovery_arguments(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            recovered_state = valid_camera_state(
+                session_id="fallback-session",
+                mouse_id="fallback-mouse",
+                local_session_dir=str(root),
+                local_video_dir=str(root / "video"),
+                remote_session_dir="/remote/fallback-session",
+                remote_video_dir="/remote/fallback-session/video",
+                remote_base_path="/remote/fallback-session/video/fallback-session",
+                remote_pid_file="/remote/fallback-session/video/camera_acquisition.pid",
+            )
+            with patch.object(rc, "STATE_FILE", root / ".vstim_natural_camera_session.json"), patch.object(
+                rc, "GENERIC_STATE_FILE", root / ".last_remote_camera_session.json"
+            ), patch.object(rc, "LEGACY_STATE_FILE", root / "legacy.json"), patch.object(
+                rc, "build_state_from_args", return_value=recovered_state
+            ) as build_state_mock, patch.object(
+                rc, "fetch_remote_camera_manifest", side_effect=RuntimeError("mocked remote manifest")
+            ), patch.object(rc, "save_state"), patch.object(rc, "append_event"), patch("builtins.print"):
+                with self.assertRaises(RuntimeError):
+                    self._dispatch_recovery_command("fetch")
+
+            build_state_mock.assert_called_once()
+
     def test_poststim_preserves_structured_camera_integrity_state(self):
         screen = FakeScreen()
         prompt_results = [True]
