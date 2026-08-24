@@ -57,6 +57,12 @@ class Patch2WorkflowTests(unittest.TestCase):
         with patch.object(base, "prompt_text", side_effect=RuntimeError("EOF")):
             with self.assertRaises(RuntimeError):
                 base.prompt_required_text("Mouse: ")
+            with self.assertRaises(RuntimeError):
+                base.prompt_int_with_default("Trials", 2, minimum=1)
+            with self.assertRaises(RuntimeError):
+                base.prompt_float_with_default("ITI", 1.0, minimum=0.0)
+            with self.assertRaises(RuntimeError):
+                base.prompt_yes_no_strict("Continue", default=True)
 
     def test_camera_selection_modes(self):
         self.assertTrue(cam.resolve_camera_selection(True, True))
@@ -144,6 +150,27 @@ class Patch2WorkflowTests(unittest.TestCase):
         )
         self.assertEqual(base.derive_session_status(False, interrupted=True), "interrupted")
         self.assertEqual(base.derive_session_status(True, noncamera_cleanup_error="oops"), "cleanup_failed")
+        self.assertEqual(
+            base.derive_session_status(
+                True,
+                camera_enabled=True,
+                camera_stop_confirmed=True,
+                camera_data_secured=False,
+                camera_cleanup_error="cleanup failed",
+            ),
+            "protocol_complete_camera_cleanup_failed",
+        )
+        self.assertEqual(
+            base.derive_session_status(
+                True,
+                camera_enabled=True,
+                camera_stop_confirmed=True,
+                camera_data_secured=True,
+            ),
+            "complete",
+        )
+        self.assertEqual(cam.finalize_exit_code(0, "protocol_complete_camera_cleanup_failed"), 2)
+        self.assertEqual(cam.finalize_exit_code(0, "stimulus_complete_camera_left_running"), 0)
 
     def test_black_baseline_operator_commands(self):
         class FakeStdin:
@@ -153,17 +180,80 @@ class Patch2WorkflowTests(unittest.TestCase):
             def readline(self):
                 return self.value
 
-        for value, expected in [("\n", "stop"), ("s\n", "stop"), ("l\n", "leave")]:
+        for value, expected in [
+            ("\n", "stop"),
+            ("y\n", "stop"),
+            ("yes\n", "stop"),
+            ("s\n", "stop"),
+            ("stop\n", "stop"),
+            ("l\n", "leave"),
+            ("leave\n", "leave"),
+        ]:
             with patch.object(cam.sys, "stdin", FakeStdin(value)), patch.object(
                 cam.select, "select", return_value=([cam.sys.stdin], [], [])
             ):
                 self.assertEqual(cam.black_baseline_operator_command(0.0), expected)
+
+        with patch.object(cam.sys, "stdin", FakeStdin("maybe\n")), patch.object(
+            cam.select, "select", return_value=([cam.sys.stdin], [], [])
+        ):
+            self.assertIsNone(cam.black_baseline_operator_command(0.0))
 
         with patch.object(cam.sys, "stdin", FakeStdin("")), patch.object(
             cam.select, "select", return_value=([cam.sys.stdin], [], [])
         ):
             with self.assertRaises(RuntimeError):
                 cam.black_baseline_operator_command(0.0)
+
+    def test_black_baseline_live_status_is_serviced_while_waiting(self):
+        class InteractiveStdin:
+            def __init__(self):
+                self.lines = ["y\n"]
+
+            def isatty(self):
+                return True
+
+            def readline(self):
+                return self.lines.pop(0)
+
+        class FakeScreen:
+            def display_raw(self, raw):
+                pass
+
+            def display_greyscale(self, level):
+                pass
+
+        stdin = InteractiveStdin()
+        stream = TtyBuffer(True)
+        reporter = base.StatusReporter(camera_enabled=True, stream=stream)
+        monotonic_value = [0.0]
+
+        def monotonic():
+            monotonic_value[0] += 1.0
+            return monotonic_value[0]
+
+        with patch.object(cam.sys, "stdin", stdin), patch.object(
+            cam.select, "select", side_effect=[([], [], []), ([], [], []), ([stdin], [], [])]
+        ), patch.object(cam.time, "monotonic", side_effect=monotonic), patch.object(
+            cam.time, "sleep", return_value=None
+        ), patch.object(cam, "stop_camera_recording", return_value={}), patch.object(
+            cam, "fetch_camera_recording", return_value={
+                "camera_fetch_completed": True,
+                "camera_conversion_completed": True,
+                "camera_conversion_deferred": False,
+            }
+        ), patch.object(base, "append_csv_row"), patch("builtins.print"):
+            result = cam.run_poststim_black_baseline(
+                FakeScreen(),
+                "iti_raw",
+                Path("/tmp/event.csv"),
+                status_reporter=reporter,
+            )
+
+        output = stream.getvalue()
+        self.assertGreaterEqual(output.count("BLACK BASELINE"), 2)
+        self.assertIn("00:00:01", output)
+        self.assertTrue(result["camera_stop_confirmed"])
 
     def test_session_manifest_is_atomic_and_uses_relative_paths(self):
         with self.subTest("manifest"):
@@ -179,6 +269,51 @@ class Patch2WorkflowTests(unittest.TestCase):
                 self.assertEqual(payload["files"]["metadata"], "s_metadata.json")
                 self.assertEqual(payload["status"], "complete")
                 self.assertFalse(list(root.glob("*.tmp")))
+
+    def test_manifest_status_matches_metadata_for_camera_outcomes(self):
+        statuses = [
+            "complete",
+            "protocol_complete_video_pending",
+            "protocol_complete_camera_cleanup_failed",
+            "stimulus_complete_camera_left_running",
+        ]
+        with __import__("tempfile").TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            for index, status in enumerate(statuses):
+                session_root = root / ("session_%d" % index)
+                session_root.mkdir()
+                metadata = {
+                    "session_id": "s%d" % index,
+                    "mouse_id": "m",
+                    "session_status": status,
+                }
+                metadata_path = session_root / "metadata.json"
+                base.atomic_write_json(metadata_path, metadata)
+                manifest_path = base.write_session_manifest(session_root, metadata, {"metadata": metadata_path})
+                self.assertEqual(json.loads(metadata_path.read_text())["session_status"], status)
+                self.assertEqual(json.loads(manifest_path.read_text())["status"], status)
+
+    def test_operational_timing_fields_are_present_and_monotonic(self):
+        fields = [
+            "initial_gray_start_monotonic_ns",
+            "initial_gray_end_monotonic_ns",
+            "task_start_monotonic_ns",
+            "task_end_monotonic_ns",
+            "final_gray_start_monotonic_ns",
+            "final_gray_end_monotonic_ns",
+            "black_baseline_start_monotonic_ns",
+            "black_baseline_end_monotonic_ns",
+            "black_baseline_elapsed_sec",
+            "camera_recording_request_monotonic_ns",
+            "camera_recording_confirmed_monotonic_ns",
+            "camera_stop_confirmed_monotonic_ns",
+            "camera_recording_elapsed_local_sec",
+        ]
+        metadata = {field: index + 1 for index, field in enumerate(fields)}
+        self.assertEqual(set(fields), set(metadata))
+        monotonic_fields = [field for field in fields if field.endswith("_monotonic_ns")]
+        values = [metadata[field] for field in monotonic_fields]
+        self.assertEqual(values, sorted(values))
 
 
 if __name__ == "__main__":

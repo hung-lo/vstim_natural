@@ -864,7 +864,7 @@ class StatusReporter:
         )
         return self.emit(line, "TASK", force=force)
 
-    def black_baseline(self, elapsed_sec, force=False, suffix="press Enter to stop camera"):
+    def black_baseline(self, elapsed_sec, force=False, suffix="Enter/y/s=stop, l=leave running"):
         line = "%s | BLACK BASELINE %s elapsed | %s" % (
             self._rec_prefix(), format_seconds(elapsed_sec), suffix
         )

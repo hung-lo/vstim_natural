@@ -119,18 +119,26 @@ after camera readiness is confirmed and freezes when stop is confirmed.
 That wrapper now asks for a pre-stimulus camera baseline in minutes, then lets
 you type `y` and press Enter to start early after the camera process is alive
 and its session-specific `.h264` file is confirmed to be growing. The baseline
-clock starts from that output-growth confirmation. After the stimulus sequence
+clock starts from that output-growth confirmation, and the PRE status countdown
+updates live after recording is confirmed. After the stimulus sequence
 finishes, it leaves the screen black until camera stop is verified by both the
 tracked PID and the session-specific acquisition-process check. The PID file is
 removed only after that verification, and the screen remains black during file
 transfer or while a failed transfer is being resolved.
 
-During the open-ended black post-stimulus baseline, type `y` and press Enter to
-stop the camera and begin verification/fetch. The screen remains black while
-camera stop, transfer, raw-file verification, MP4 conversion, and remote raw
-cleanup are completed. Type `l` and press Enter only when you explicitly need
-to leave the camera running; the session is then marked
+During the open-ended black post-stimulus baseline, press Enter or type `y`,
+`yes`, `s`, or `stop`, then press Enter to stop the camera and begin
+verification/fetch. The screen remains black while camera stop, transfer,
+raw-file verification, MP4 conversion, and remote raw cleanup are completed.
+Type `l` or `leave` and press Enter only when you explicitly need to leave the
+camera running; the session is then marked
 `stimulus_complete_camera_left_running`.
+
+The planned task ETA uses the exact realized ITIs in the session sequence.
+Camera transfer/conversion and the open-ended black baseline are not included
+in that planned estimate. The photodiode remains the physical display-timing
+ground truth; software timestamps describe display requests and operational
+state.
 
 Keep `run_stringer_vstim.py` around as the plain no-camera runner and as the
 baseline path if you want to debug the display flow independently.

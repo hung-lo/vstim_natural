@@ -51,6 +51,13 @@ def resolve_camera_selection(requested, support_available, prompt=True):
     return base.prompt_yes_no_strict("Record face camera?", default=True) if prompt else True
 
 
+def finalize_exit_code(exit_code, session_status):
+    """Keep cleanup-failure metadata and process status consistent."""
+    if session_status == "protocol_complete_camera_cleanup_failed":
+        return max(int(exit_code), 2)
+    return int(exit_code)
+
+
 def subprocess_output_to_text(value):
     if value is None:
         return ""
@@ -382,11 +389,13 @@ def wait_for_prestimulus_gate(
         result["end_reason"] = "timer_elapsed"
 
     while True:
-        if status_callback is not None:
-            status_callback(result)
         now_monotonic = time.monotonic()
         camera_baseline_elapsed_sec = now_monotonic - baseline_start_monotonic
         gray_elapsed_sec = now_monotonic - gray_start_monotonic
+        result["camera_baseline_elapsed_sec"] = camera_baseline_elapsed_sec
+        result["gray_elapsed_sec"] = gray_elapsed_sec
+        if status_callback is not None:
+            status_callback(result)
         baseline_ready = force_start_event.is_set() or camera_baseline_elapsed_sec >= requested_baseline_sec
         gray_ready = gray_elapsed_sec >= minimum_gray_sec
 
@@ -434,8 +443,9 @@ def wait_for_prestimulus_gate(
         elif not baseline_ready:
             print("Pre-stimulus baseline remaining: %s ..." % base.format_seconds(max(0.0, requested_baseline_sec - camera_baseline_elapsed_sec)))
 
-    result["camera_baseline_elapsed_sec"] = time.monotonic() - baseline_start_monotonic
-    result["gray_elapsed_sec"] = time.monotonic() - gray_start_monotonic
+    now_monotonic = time.monotonic()
+    result["camera_baseline_elapsed_sec"] = now_monotonic - baseline_start_monotonic
+    result["gray_elapsed_sec"] = now_monotonic - gray_start_monotonic
     if not result["end_reason"]:
         result["end_reason"] = "timer_elapsed"
     return result
@@ -512,11 +522,11 @@ def black_baseline_operator_command(timeout_sec=0.25):
     if line == "":
         raise RuntimeError("Black-baseline input ended at EOF; camera state must be resolved explicitly.")
     command = line.strip().lower()
-    if command in {"", "s", "stop"}:
+    if command in {"", "y", "yes", "s", "stop"}:
         return "stop"
     if command in {"l", "leave"}:
         return "leave"
-    print("Invalid command. Press Enter or type s to stop, or l to leave the camera running.")
+    print("Invalid command. Press Enter or type y/yes/s/stop to stop, or l to leave the camera running.")
     return None
 
 
@@ -772,7 +782,10 @@ def run_poststim_black_baseline(
             break
 
         if not should_stop:
-            print("Black post-stimulus baseline continues. Type y and Enter when ready to stop.")
+            print(
+                "Black post-stimulus baseline continues. Press Enter or type y/yes/s/stop and Enter to stop; "
+                "type l and Enter to leave the camera running."
+            )
             continue
 
         resolve_camera_stop_before_exit("poststim_black_active=true")
@@ -1174,7 +1187,8 @@ def main(argv=None):
     print("  Gray baseline: the monitor is set to the ITI-style gray frame before camera start")
     print("  Early start: type y and press Enter after recording begins")
     print("  Post-stimulus: 3.0 s controlled gray, then open-ended full-screen black")
-    print("  Type y and Enter to stop the camera and end the black baseline")
+    print("  BLACK BASELINE: press Enter or type y/yes/s/stop and Enter to stop")
+    print("  BLACK BASELINE: type l and Enter only to leave the camera running")
     print("  The screen stays black during camera stop and file transfer")
     print("  Total trials: %d" % len(trials))
     print("  Stimulus duration: %.3f s" % base.STIM_DURATION_SEC)
@@ -1319,7 +1333,10 @@ def main(argv=None):
         "trials": trials,
         "camera_enabled": True,
         "camera_control_script": str(CAMERA_CONTROL_SCRIPT),
-        "camera_stop_prompt": "Type y and Enter to stop the camera while the black baseline is active.",
+        "camera_stop_prompt": (
+            "During BLACK BASELINE, press Enter or type y/yes/s/stop and Enter to stop; "
+            "type l and Enter to leave the camera running."
+        ),
     }
     base.atomic_write_json(metadata_path, metadata)
     base.write_session_manifest(
@@ -1365,6 +1382,7 @@ def main(argv=None):
     baseline_result = None
     poststim_result = None
     camera_stop_handled = False
+    camera_left_running_by_user = False
     camera_fetch_completed = False
     session_status = "incomplete"
     primary_failure = False
@@ -1704,14 +1722,19 @@ def main(argv=None):
                 except Exception:
                     pass
 
-        return exit_code
-
     finally:
         stop_prestimulus_early_start_monitor(force_input_stop_event, force_input_thread)
         camera_stopped = poststim_result["camera_stop_confirmed"] if poststim_result else False
         camera_fetch_completed = poststim_result["camera_fetch_completed"] if poststim_result else False
         if camera_started and not camera_stop_handled:
-            if base.prompt_yes_no("Stop camera recording now", default_yes=False):
+            emergency_stop_requested = False
+            try:
+                emergency_stop_requested = base.prompt_yes_no("Stop camera recording now", default_yes=False)
+            except Exception as exc:
+                print("ERROR choosing emergency camera cleanup: %s" % exc, file=sys.stderr)
+                camera_cleanup_error = str(exc)
+                exit_code = 2
+            if emergency_stop_requested:
                 try:
                     camera_timing["camera_stop_confirmed_monotonic_ns"] = time.monotonic_ns()
                     stop_camera_recording()
@@ -1721,7 +1744,8 @@ def main(argv=None):
                     print("ERROR stopping camera: %s" % exc, file=sys.stderr)
                     camera_cleanup_error = str(exc)
                     exit_code = 2
-            else:
+            elif not camera_cleanup_error:
+                camera_left_running_by_user = True
                 print(
                     "Camera left running. Stop it later with: "
                     "python3 remote_camera_control.py stop"
@@ -1739,7 +1763,6 @@ def main(argv=None):
         metadata["camera_conversion_completed"] = poststim_result["camera_conversion_completed"] if poststim_result else False
         metadata["camera_conversion_deferred"] = poststim_result["camera_conversion_deferred"] if poststim_result else False
         metadata["camera_fetch_deferred"] = poststim_result["camera_fetch_deferred"] if poststim_result else False
-        metadata["camera_left_running_by_user"] = poststim_result["camera_left_running_by_user"] if poststim_result else False
         metadata["camera_fetch_started"] = poststim_result["camera_fetch_started"] if poststim_result else False
         metadata["camera_session_id"] = session_id if camera_started else ""
         metadata["session_completed_semantics"] = (
@@ -1770,6 +1793,15 @@ def main(argv=None):
         }
         for field, default in metadata_defaults.items():
             metadata[field] = poststim_result.get(field, default) if poststim_result else default
+        metadata["camera_left_running_by_user"] = (
+            bool(poststim_result and poststim_result.get("camera_left_running_by_user"))
+            or camera_left_running_by_user
+        )
+        metadata["camera_cleanup_error"] = (
+            camera_cleanup_error
+            or metadata.get("camera_cleanup_error", "")
+            or (poststim_result or {}).get("remote_raw_cleanup_error", "")
+        )
         for field in (
             "initial_gray_start_monotonic_ns",
             "initial_gray_end_monotonic_ns",
@@ -1810,7 +1842,7 @@ def main(argv=None):
             camera_enabled=True,
             camera_stop_confirmed=bool(poststim_result and poststim_result.get("camera_stop_confirmed")),
             camera_data_secured=bool(poststim_result and poststim_result.get("camera_data_secured")),
-            camera_left_running_by_user=bool(poststim_result and poststim_result.get("camera_left_running_by_user")),
+            camera_left_running_by_user=metadata["camera_left_running_by_user"],
             camera_cleanup_error=final_camera_cleanup_error,
             interrupted=interrupted,
             primary_failure=primary_failure,
@@ -1887,12 +1919,14 @@ def main(argv=None):
             print("Session finished. Files are in: %s" % session_root)
         else:
             print("Session stopped early. Partial files are in: %s" % session_root)
-        if poststim_result and poststim_result.get("camera_left_running_by_user"):
+        if metadata["camera_left_running_by_user"]:
             print(
                 "Camera is still recording remotely. Stop it later with: "
                 "python3 remote_camera_control.py stop"
             )
         sys.stdout.flush()
+
+    return finalize_exit_code(exit_code, metadata.get("session_status", "incomplete"))
 
 
 if __name__ == "__main__":

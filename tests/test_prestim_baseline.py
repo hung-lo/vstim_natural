@@ -195,6 +195,28 @@ class PrestimBaselineTests(unittest.TestCase):
         self.assertAlmostEqual(result["gray_elapsed_sec"], 10.0)
         self.assertEqual(event.wait_timeouts, [5.0])
 
+    def test_wait_for_prestimulus_gate_status_countdown_updates_before_callback(self):
+        clock = FakeClock(0.0)
+        event = FakeGateEvent(clock)
+        callbacks = []
+
+        with patch.object(cam.time, "monotonic", side_effect=clock.monotonic), patch("builtins.print"):
+            result = cam.wait_for_prestimulus_gate(
+                0.0,
+                10.0,
+                0.0,
+                3.0,
+                event,
+                status_callback=lambda state: callbacks.append(
+                    (state["camera_baseline_elapsed_sec"], state["requested_sec"] - state["camera_baseline_elapsed_sec"])
+                ),
+            )
+
+        self.assertGreater(len(callbacks), 1)
+        self.assertEqual([elapsed for elapsed, _ in callbacks], sorted(elapsed for elapsed, _ in callbacks))
+        self.assertLess(callbacks[-1][1], callbacks[0][1])
+        self.assertGreaterEqual(result["camera_baseline_elapsed_sec"], 10.0)
+
     def test_wait_for_prestimulus_gate_timer_elapsed_but_gray_not_ready(self):
         clock = FakeClock(5.0)
         event = FakeGateEvent(clock)
