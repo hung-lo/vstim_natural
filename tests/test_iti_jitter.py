@@ -24,6 +24,9 @@ import run_stringer_vstim as base
 
 
 class ItiJitterTests(unittest.TestCase):
+    def test_session_output_schema_version_is_three(self):
+        self.assertEqual(base.SESSION_OUTPUT_SCHEMA_VERSION, 3)
+
     def image_files(self, count=8):
         return [Path("/tmp/image_%03d.png" % index) for index in range(count)]
 
@@ -90,6 +93,32 @@ class ItiJitterTests(unittest.TestCase):
             sum(float(trial["planned_stim_duration_sec"]) for trial in trials)
             + sum(float(trial["planned_iti_duration_sec"]) for trial in trials[:-1]),
         )
+
+    def test_final_iti_policy_metadata_matches_realized_flags(self):
+        plain_trials = [{"planned_iti_duration_sec": 0.8}]
+        base.set_iti_playback_flags(plain_trials, include_final_iti=True)
+        plain = base.final_iti_policy_metadata(plain_trials, True, "no_camera")
+        self.assertEqual(plain["runner_variant"], "no_camera")
+        self.assertTrue(plain["include_final_iti"])
+        self.assertEqual(plain["final_iti_policy"], "played_before_final_gray")
+        self.assertTrue(plain["final_iti_played"])
+        self.assertAlmostEqual(plain["final_iti_duration_sec"], 0.8)
+        self.assertAlmostEqual(plain["final_planned_iti_duration_sec"], 0.8)
+
+        camera_trials = [{"planned_iti_duration_sec": 0.8}]
+        base.set_iti_playback_flags(camera_trials, include_final_iti=False)
+        camera = base.final_iti_policy_metadata(camera_trials, False, "camera")
+        self.assertEqual(camera["runner_variant"], "camera")
+        self.assertFalse(camera["include_final_iti"])
+        self.assertEqual(camera["final_iti_policy"], "skipped_before_poststim_gray")
+        self.assertFalse(camera["final_iti_played"])
+        self.assertEqual(camera["final_iti_duration_sec"], 0.0)
+        self.assertAlmostEqual(camera["final_planned_iti_duration_sec"], 0.8)
+
+        empty = base.final_iti_policy_metadata([], True, "no_camera")
+        self.assertFalse(empty["final_iti_played"])
+        self.assertEqual(empty["final_iti_duration_sec"], 0.0)
+        self.assertEqual(empty["final_planned_iti_duration_sec"], 0.0)
 
     def test_iti_raw_cache_only_builds_the_19_permitted_frame_counts(self):
         calls = []

@@ -29,7 +29,7 @@ IMAGE_DIR_CANDIDATES = [
 ]
 OUTPUT_ROOT = Path("/mnt/hd")
 SESSION_NAME_SUFFIX = "vstim_natural"
-SESSION_OUTPUT_SCHEMA_VERSION = 2
+SESSION_OUTPUT_SCHEMA_VERSION = 3
 EVENT_LOG_SCHEMA_VERSION = 1
 PLANNED_SEQUENCE_SCHEMA_VERSION = 1
 STATUS_TTY_INTERVAL_SEC = 1.0
@@ -366,6 +366,27 @@ def set_iti_playback_flags(trials, include_final_iti=True):
     for index, trial in enumerate(trials):
         trial["iti_will_play"] = bool(include_final_iti or index < len(trials) - 1)
     return trials
+
+
+def final_iti_policy_metadata(trials, include_final_iti, runner_variant):
+    """Summarize the realized final-ITI policy without changing playback flags."""
+    final_planned_sec = float(trials[-1]["planned_iti_duration_sec"]) if trials else 0.0
+    final_iti_played = bool(
+        trials
+        and trials[-1].get("iti_will_play", bool(include_final_iti))
+    )
+    return {
+        "runner_variant": runner_variant,
+        "include_final_iti": bool(include_final_iti),
+        "final_iti_policy": (
+            "played_before_final_gray"
+            if include_final_iti
+            else "skipped_before_poststim_gray"
+        ),
+        "final_iti_played": final_iti_played,
+        "final_iti_duration_sec": final_planned_sec if final_iti_played else 0.0,
+        "final_planned_iti_duration_sec": final_planned_sec,
+    }
 
 
 def calculate_planned_sequence_duration(trials, include_final_iti=True):
@@ -1044,6 +1065,7 @@ def main(argv=None):
     adjacent_repeat_count = count_adjacent_image_repeats(trials)
     set_iti_playback_flags(trials, include_final_iti=True)
     planned_playback_sec = calculate_planned_sequence_duration(trials, include_final_iti=True)
+    final_iti_metadata = final_iti_policy_metadata(trials, True, "no_camera")
 
     print()
     print("Session setup summary:")
@@ -1054,6 +1076,10 @@ def main(argv=None):
     print("  Total trials: %d" % len(trials))
     print("  Stimulus duration: %.3f s" % STIM_DURATION_SEC)
     print("  ITI range: %.3f-%.3f s (%d-%d frames)" % (ITI_MIN_SEC, ITI_MAX_SEC, iti_frame_bounds()[0], iti_frame_bounds()[1]))
+    print(
+        "  Final trial ITI: played before final gray (%.3f s)"
+        % final_iti_metadata["final_iti_duration_sec"]
+    )
     print("  Planned task duration: %s" % format_duration(planned_task_duration_seconds(trials)))
     print("  Planned stimulus protocol: %s" % format_duration(planned_playback_sec + INITIAL_GRAY_SEC + FINAL_GRAY_SEC))
     print("  Post-stimulus black baseline: not used by this runner")
@@ -1148,10 +1174,8 @@ def main(argv=None):
         "n_images_to_use": n_images_to_use,
         "n_repeats": n_repeats,
         "planned_sequence_duration_sec": planned_playback_sec,
+        **final_iti_metadata,
         "planned_task_duration_sec": planned_task_duration_seconds(trials),
-        "include_final_iti": True,
-        "final_iti_played": bool(trials and trials[-1].get("iti_will_play", True)),
-        "final_iti_policy": "played_before_final_gray",
         "image_subset_seed": IMAGE_SUBSET_SEED,
         "resolved_image_subset_seed": IMAGE_SUBSET_SEED,
         "trial_order_seed": TRIAL_ORDER_SEED,

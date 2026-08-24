@@ -191,6 +191,8 @@ camera timing, exact realized ITIs, and operational statuses including
 Manifest artifact entries are existence-aware: an artifact is listed by its
 relative path only after it exists, and unavailable optional camera artifacts
 are recorded as `null` rather than as fabricated paths.
+Session output schema v3 records this optional-artifact behavior and the
+explicit final-ITI policy metadata.
 
 ## Photodiode patch
 
@@ -218,7 +220,9 @@ gray screen and records `final_iti_policy=played_before_final_gray`. The
 camera runner skips the final planned ITI and transitions directly to its
 controlled post-stimulus gray/black workflow, recording
 `final_iti_policy=skipped_before_poststim_gray`. These metadata fields describe
-the existing behavior; they do not change timing.
+the existing behavior; they do not change timing. Session output schema v3
+also records `runner_variant`, `final_iti_played`, `include_final_iti`,
+`final_iti_duration_sec`, and `final_planned_iti_duration_sec`.
 
 Only the 19 possible ITI raw files are cached per session:
 `gray_iti_042f.raw` through `gray_iti_060f.raw`.

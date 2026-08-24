@@ -1175,6 +1175,7 @@ def main(argv=None):
     adjacent_repeat_count = base.count_adjacent_image_repeats(trials)
     base.set_iti_playback_flags(trials, include_final_iti=False)
     planned_playback_sec = base.calculate_planned_sequence_duration(trials, include_final_iti=False)
+    final_iti_metadata = base.final_iti_policy_metadata(trials, False, "camera")
 
     print()
     print("Session setup summary:")
@@ -1193,6 +1194,10 @@ def main(argv=None):
     print("  Total trials: %d" % len(trials))
     print("  Stimulus duration: %.3f s" % base.STIM_DURATION_SEC)
     print("  ITI range: %.3f-%.3f s (%d-%d frames)" % (base.ITI_MIN_SEC, base.ITI_MAX_SEC, base.iti_frame_bounds()[0], base.iti_frame_bounds()[1]))
+    print(
+        "  Final trial ITI: skipped; generated plan was %.3f s"
+        % final_iti_metadata["final_planned_iti_duration_sec"]
+    )
     print("  Initial gray duration: %.3f s" % base.INITIAL_GRAY_SEC)
     print("  Final gray duration: %.3f s" % base.FINAL_GRAY_SEC)
     print("  Planned task duration: %s" % base.format_duration(base.planned_task_duration_seconds(trials)))
@@ -1289,10 +1294,8 @@ def main(argv=None):
         "n_images_to_use": n_images_to_use,
         "n_repeats": n_repeats,
         "planned_sequence_duration_sec": planned_playback_sec,
+        **final_iti_metadata,
         "planned_task_duration_sec": base.planned_task_duration_seconds(trials),
-        "include_final_iti": False,
-        "final_iti_played": bool(trials and trials[-1].get("iti_will_play", False)),
-        "final_iti_policy": "skipped_before_poststim_gray",
         "image_subset_seed": base.IMAGE_SUBSET_SEED,
         "resolved_image_subset_seed": base.IMAGE_SUBSET_SEED,
         "trial_order_seed": base.TRIAL_ORDER_SEED,

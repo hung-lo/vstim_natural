@@ -298,6 +298,60 @@ class CameraControlAndPoststimTests(unittest.TestCase):
         self.assertEqual(screen.calls, [("display_raw", "stim1"), ("display_raw", "iti_raw"), ("display_raw", "stim2")])
         self.assertEqual(event_types, ["stim_on", "iti_on", "stim_on"])
 
+    def test_run_trial_sequence_plays_final_iti_for_plain_runner(self):
+        screen = FakeScreen()
+        trials = [
+            {"trial_index": 1, "repeat_number": 1, "image_index": 0, "image_id": "img1", "image_filename": "img1.png", "image_path": "/tmp/img1.png", "planned_stim_duration_sec": 0.5, "planned_iti_duration_sec": 0.75},
+            {"trial_index": 2, "repeat_number": 1, "image_index": 1, "image_id": "img2", "image_filename": "img2.png", "image_path": "/tmp/img2.png", "planned_stim_duration_sec": 0.5, "planned_iti_duration_sec": 0.75},
+        ]
+        loaded_stim_raws = {"img1": "stim1", "img2": "stim2"}
+        stim_raw_paths = {"img1": Path("/stim1.raw"), "img2": Path("/stim2.raw")}
+        event_types = []
+
+        def fake_display_raw_with_timing(screen_arg, raw):
+            screen_arg.display_raw(raw)
+            return (
+                types.SimpleNamespace(start_time=1.0, mean_interframe=2.0, stddev_interframe=3.0),
+                {
+                    "request_utc_iso": "now",
+                    "request_unix_sec": 1.0,
+                    "return_utc_iso": "later",
+                    "request_unix_ns": 10,
+                    "return_unix_ns": 20,
+                    "request_perf_counter_ns": 30,
+                    "return_perf_counter_ns": 40,
+                    "duration_sec": 0.5,
+                },
+            )
+
+        def fake_append_csv_row(path, row, fieldnames):
+            event_types.append(row["event_type"])
+
+        with patch.object(base, "display_raw_with_timing", side_effect=fake_display_raw_with_timing), patch.object(
+            base, "append_csv_row", side_effect=fake_append_csv_row
+        ), patch("builtins.print"):
+            base.run_trial_sequence(
+                screen,
+                trials,
+                loaded_stim_raws,
+                "iti_raw",
+                stim_raw_paths,
+                Path("/iti.raw"),
+                Path("/tmp/event.csv"),
+                include_final_iti=True,
+            )
+
+        self.assertEqual(
+            screen.calls,
+            [
+                ("display_raw", "stim1"),
+                ("display_raw", "iti_raw"),
+                ("display_raw", "stim2"),
+                ("display_raw", "iti_raw"),
+            ],
+        )
+        self.assertEqual(event_types, ["stim_on", "iti_on", "stim_on", "iti_on"])
+
     def test_black_poststim_helper_keeps_screen_black_during_stop_and_fetch(self):
         screen = FakeScreen()
         event_types = []
