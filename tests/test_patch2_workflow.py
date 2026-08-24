@@ -4,6 +4,8 @@ import math
 import sys
 import types
 import unittest
+from collections import defaultdict
+from contextlib import ExitStack
 from pathlib import Path
 from unittest.mock import patch
 
@@ -35,6 +37,143 @@ class TtyBuffer(io.StringIO):
 
 
 class Patch2WorkflowTests(unittest.TestCase):
+    def _run_mocked_camera_main_for_exit_path(self, primary_failure=False):
+        with __import__("tempfile").TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            image_dir = root / "images"
+            image_dir.mkdir()
+            image_path = image_dir / "image_001.png"
+            image_path.write_text("placeholder")
+            output_root = root / "output"
+
+            class FakeScreen:
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, exc_type, exc_value, traceback):
+                    return False
+
+                def load_raw(self, path):
+                    return "raw:%s" % path
+
+            fake_rpg = types.SimpleNamespace(Screen=lambda *args, **kwargs: FakeScreen())
+            trials = [
+                {
+                    "trial_index": 0,
+                    "image_index": 0,
+                    "image_id": 1,
+                    "image_filename": image_path.name,
+                    "image_path": str(image_path),
+                    "repeat_number": 0,
+                    "planned_stim_duration_sec": 0.5,
+                    "planned_iti_frames": 42,
+                    "planned_iti_duration_sec": 0.7,
+                    "iti_will_play": False,
+                }
+            ]
+            display_timing = {
+                "request_unix_ns": 1,
+                "request_unix_sec": 1,
+                "request_utc_iso": "2020-01-01T00:00:00Z",
+                "return_unix_ns": 2,
+                "return_utc_iso": "2020-01-01T00:00:00Z",
+                "request_perf_counter_ns": 1,
+                "return_perf_counter_ns": 2,
+                "duration_sec": 0.1,
+            }
+            timestamp = {"utc_iso": "2020-01-01T00:00:00Z", "unix_sec": 1, "unix_ns": 1}
+            prestim_result = {
+                "requested_sec": 0.0,
+                "minimum_gray_sec": 0.0,
+                "camera_baseline_elapsed_sec": 0.0,
+                "gray_elapsed_sec": 0.0,
+                "forced": False,
+                "end_reason": "timer_satisfied_during_preparation",
+                "waited_for_minimum_gray_after_override": False,
+                "remaining_camera_baseline_sec_at_gate_entry": 0.0,
+            }
+            poststim_result = defaultdict(lambda: False, {
+                "stimulus_playback_completed": True,
+                "camera_stop_confirmed": False,
+                "camera_left_running_by_user": False,
+                "camera_fetch_completed": False,
+                "session_completed": False,
+                "camera_cleanup_error": "",
+                "remote_raw_cleanup_error": "",
+                "camera_data_secured": False,
+            })
+            camera_start_result = {
+                "confirmed_running": True,
+                "controller_state": {
+                    "camera_start_command_returned": True,
+                    "camera_process_confirmed": True,
+                    "camera_output_file_detected": True,
+                    "camera_output_growing_confirmed": True,
+                    "camera_output_file": "/remote/session/video/session.h264",
+                    "camera_output_growth_confirmed_utc": "2020-01-01T00:00:00Z",
+                },
+                "error": "",
+                "cleanup_attempted": False,
+                "cleanup_confirmed": False,
+                "camera_state_unknown_acknowledged": False,
+            }
+
+            with ExitStack() as stack:
+                stack.enter_context(patch.dict(sys.modules, {"rpg": fake_rpg}))
+                stack.enter_context(patch.object(cam, "OUTPUT_ROOT", output_root))
+                stack.enter_context(patch.object(base, "resolve_image_dir", return_value=image_dir))
+                stack.enter_context(patch.object(base, "list_png_files", return_value=[image_path]))
+                stack.enter_context(patch.object(base, "select_image_subset", return_value=[image_path]))
+                stack.enter_context(patch.object(base, "make_trial_sequence", return_value=(trials, 1, 2)))
+                stack.enter_context(patch.object(base, "set_iti_playback_flags"))
+                stack.enter_context(patch.object(base, "build_stim_raw_cache", return_value={"image_001": image_path}))
+                stack.enter_context(patch.object(base, "build_iti_raw_cache", return_value={60: image_path}))
+                stack.enter_context(patch.object(base, "display_raw_with_timing", return_value=(object(), display_timing)))
+                stack.enter_context(patch.object(base, "capture_timestamp", return_value=timestamp))
+                stack.enter_context(patch.object(base, "run_trial_sequence"))
+                stack.enter_context(patch.object(base, "make_session_name", return_value="mouse_20200101T000000Z_vstim_natural"))
+                stack.enter_context(patch.object(base, "utc_session_stamp", return_value="20200101T000000Z"))
+                stack.enter_context(patch.object(base, "prompt_yes_no_strict", return_value=True))
+                stack.enter_context(patch.object(base, "prompt_yes_no", return_value=True))
+                stack.enter_context(patch.object(cam, "start_camera_recording_with_recovery", return_value=camera_start_result))
+                stack.enter_context(patch.object(cam, "start_prestimulus_early_start_monitor", return_value=(None, None, None, False)))
+                stack.enter_context(patch.object(cam, "stop_prestimulus_early_start_monitor"))
+                stack.enter_context(patch.object(cam, "wait_for_prestimulus_gate", return_value=prestim_result))
+                stop_error = RuntimeError("secondary cleanup failure" if primary_failure else "stop failed")
+                stack.enter_context(patch.object(cam, "stop_camera_recording", side_effect=stop_error))
+                if primary_failure:
+                    stack.enter_context(
+                        patch.object(cam, "run_poststim_black_baseline", side_effect=RuntimeError("primary failure"))
+                    )
+                else:
+                    stack.enter_context(patch.object(cam, "run_poststim_black_baseline", return_value=poststim_result))
+
+                raised = None
+                result = None
+                try:
+                    result = cam.main(
+                        [
+                            "--camera",
+                            "--mouse-id",
+                            "mouse",
+                            "--session-notes",
+                            "test",
+                            "--num-images",
+                            "1",
+                            "--repeats",
+                            "1",
+                            "--prestim-baseline-minutes",
+                            "0",
+                        ]
+                    )
+                except Exception as exc:
+                    raised = exc
+
+            session_root = output_root / "mouse_20200101T000000Z_vstim_natural"
+            metadata = json.loads(next(session_root.glob("*_metadata.json")).read_text())
+            manifest = json.loads((session_root / "session_manifest.json").read_text())
+            return result, raised, metadata, manifest
+
     def test_required_mouse_id_reprompts_and_rejects_sanitized_empty(self):
         with patch.object(base, "prompt_text", side_effect=["   ", "!!!", "Mouse 7"]):
             self.assertEqual(base.prompt_required_text("Mouse: ", base.sanitize_text), "Mouse_7")
@@ -63,6 +202,25 @@ class Patch2WorkflowTests(unittest.TestCase):
                 base.prompt_float_with_default("ITI", 1.0, minimum=0.0)
             with self.assertRaises(RuntimeError):
                 base.prompt_yes_no_strict("Continue", default=True)
+
+    def test_outer_camera_stop_failure_is_nonzero_and_persisted(self):
+        result, raised, metadata, manifest = self._run_mocked_camera_main_for_exit_path()
+        self.assertIsNone(raised)
+        self.assertEqual(result, 2)
+        self.assertEqual(metadata["camera_cleanup_error"], "stop failed")
+        self.assertEqual(metadata["session_status"], "protocol_complete_camera_cleanup_failed")
+        self.assertEqual(manifest["status"], metadata["session_status"])
+        self.assertNotEqual(result, 0)
+        self.assertNotEqual(metadata["session_status"], "complete")
+
+    def test_primary_failure_remains_primary_when_camera_cleanup_also_fails(self):
+        result, raised, metadata, manifest = self._run_mocked_camera_main_for_exit_path(primary_failure=True)
+        self.assertIsNone(result)
+        self.assertIsNotNone(raised)
+        self.assertEqual(str(raised), "primary failure")
+        self.assertEqual(metadata["camera_cleanup_error"], "secondary cleanup failure")
+        self.assertEqual(metadata["session_status"], "failed")
+        self.assertEqual(manifest["status"], "failed")
 
     def test_camera_selection_modes(self):
         self.assertTrue(cam.resolve_camera_selection(True, True))
